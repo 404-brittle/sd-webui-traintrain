@@ -13,6 +13,130 @@ BLOCKID_ANIMA = ["BASE"] + ["B{:02d}".format(x) for x in range(28)]
 
 ANIMA_TARGET_REPLACE_MODULE = ["Block"]
 
+# ---------------------------------------------------------------------------
+# Anima layer-type reference  (verified against anima_keys.txt dump)
+# ---------------------------------------------------------------------------
+# Each of the 28 DiT blocks (B00–B27) contains exactly these 16 LoRA keys:
+#
+#   self_attn_q_proj              )
+#   self_attn_k_proj              ) self-attention projections  ← GOOD to train
+#   self_attn_v_proj              )
+#   self_attn_output_proj         )
+#
+#   cross_attn_q_proj             )
+#   cross_attn_k_proj             ) cross-attention projections ← GOOD to train
+#   cross_attn_v_proj             )
+#   cross_attn_output_proj        )
+#
+#   mlp_layer1                    ) feed-forward MLP            ← GOOD to train
+#   mlp_layer2                    )
+#
+#   adaln_modulation_self_attn_1  )
+#   adaln_modulation_self_attn_2  )
+#   adaln_modulation_cross_attn_1 ) per-component AdaLN         ← AVOID (see note)
+#   adaln_modulation_cross_attn_2 )
+#   adaln_modulation_mlp_1        )
+#   adaln_modulation_mlp_2        )
+#
+# adaln_modulation note:
+#   Each of the 6 adaln_modulation layers converts the shared timestep
+#   embedding into per-component scale+shift parameters for one sub-layer's
+#   layer norm.  Together they represent 168 of the 448 total LoRA keys
+#   (37.5 %).  Training them with LoRA offsets the denoising schedule in a
+#   way that accumulates across all 28 blocks and all timesteps — including
+#   those not seen in training — which tends to produce artefacts.  The
+#   standard recommendation is to exclude them.
+#
+# Common filter strings (set network_module_filter in the UI):
+#   ""                                  → train all 448 layers (default)
+#   "!adaln_modulation"                 → skip adaln (recommended) — 280 layers
+#   "self_attn, cross_attn"             → attention only — 224 layers
+#   "self_attn, cross_attn, mlp"        → attn + MLP — 280 layers (same count,
+#                                          different set from !adaln_modulation)
+#   "self_attn"                         → self-attention only — 112 layers
+# ---------------------------------------------------------------------------
+
+
+def _matches_module_filter(lora_name: str, filter_str: str) -> bool:
+    """Return True if *lora_name* passes the user-supplied regex filter.
+
+    *filter_str* is a comma- or newline-separated list of regex patterns.
+    Patterns prefixed with ``!`` are *exclusions*; all others are *inclusions*.
+
+    Matching rules
+    --------------
+    * Empty filter            → include everything (default behaviour).
+    * Inclusion patterns only → include only modules that match at least one.
+    * Exclusion patterns only → include everything *except* excluded modules.
+    * Mixed                   → a module must match an inclusion pattern AND
+                                 must not match any exclusion pattern.
+
+    Matching is case-insensitive.
+    """
+    patterns = [p.strip() for p in re.split(r'[,\n]+', filter_str) if p.strip()]
+    if not patterns:
+        return True
+
+    inclusions = [p for p in patterns if not p.startswith('!')]
+    exclusions = [p[1:] for p in patterns if p.startswith('!')]
+
+    def _safe_search(pattern, text):
+        try:
+            return bool(re.search(pattern, text, re.IGNORECASE))
+        except re.error:
+            return False
+
+    # Inclusion gate
+    if inclusions:
+        if not any(_safe_search(inc, lora_name) for inc in inclusions):
+            return False
+
+    # Exclusion gate
+    for exc in exclusions:
+        if exc and _safe_search(exc, lora_name):
+            return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Literal LoRA key list for all 28 Anima DiT blocks
+# Sourced directly from anima_keys.txt (448 keys, 16 per block).
+# ---------------------------------------------------------------------------
+
+# Exact sublayer names in the order they appear per block.
+_ANIMA_BLOCK_SUBLAYERS = (
+    "adaln_modulation_cross_attn_1",
+    "adaln_modulation_cross_attn_2",
+    "adaln_modulation_mlp_1",
+    "adaln_modulation_mlp_2",
+    "adaln_modulation_self_attn_1",
+    "adaln_modulation_self_attn_2",
+    "cross_attn_k_proj",
+    "cross_attn_output_proj",
+    "cross_attn_q_proj",
+    "cross_attn_v_proj",
+    "mlp_layer1",
+    "mlp_layer2",
+    "self_attn_k_proj",
+    "self_attn_output_proj",
+    "self_attn_q_proj",
+    "self_attn_v_proj",
+)
+
+
+def generate_anima_preview_keys():
+    """Return the full list of 448 Anima LoRA key names (16 per block × 28 blocks).
+
+    Keys are identical to those produced during training; sourced from
+    anima_keys.txt.
+    """
+    return [
+        f"lora_unet_blocks_{b}_{sl}"
+        for b in range(28)
+        for sl in _ANIMA_BLOCK_SUBLAYERS
+    ]
+
 BLOCKS=["encoder",
 "diffusion_model_input_blocks_0_",
 "diffusion_model_input_blocks_1_",
@@ -260,6 +384,11 @@ class LoRANetwork(nn.Module):
                                     currentblock = BLOCKID26[i]
 
                         if currentblock not in t.network_blocks:
+                            continue
+
+                        # Per-layer regex filter (Anima: skip adaln_modulation etc.)
+                        module_filter = getattr(t, 'network_module_filter', '') or ''
+                        if module_filter.strip() and not _matches_module_filter(lora_name, module_filter):
                             continue
 
                         if is_linear or is_conv2d_1x1:

@@ -21,7 +21,7 @@ presetspath = trainer.presetspath
 MODES = ["LoRA", "ADDifT", "Multi-ADDifT"]
 
 # Anima DiT block IDs: BASE (text encoder / global) + B00-B27 (28 transformer blocks)
-from trainer.lora import BLOCKID_ANIMA
+from trainer.lora import BLOCKID_ANIMA, generate_anima_preview_keys, _matches_module_filter
 
 PRECISION_TYPES = ["fp32", "bf16", "fp16", "float32", "bfloat16", "float16"]
 NETWORK_TYPES = ["lierla", "c3lier", "loha"]
@@ -92,6 +92,11 @@ train_repeat        = ["train_repeat",       "TX", None, 1,    int,   ALL]
 gradient_accumulation_steps = ["gradient_accumulation_steps","TX", None, "1", str, ALL]
 train_min_timesteps = ["train_min_timesteps","TX", None, 0,    int,   ALL]
 train_max_timesteps = ["train_max_timesteps","TX", None, 1000, int,   ALL]
+# Regex-based sub-layer filter.  Comma/newline separated; prefix with ! to exclude.
+# Examples:  "!adaln_modulation"   →  skip adaln (recommended for Anima)
+#            "attn, mlp"           →  attention + MLP only
+#            "attn"                →  attention projections only
+network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", None, "", str, ALL]
 
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
@@ -104,7 +109,7 @@ o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps]
-o_column4 = [train_min_timesteps, train_max_timesteps]
+o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 
@@ -127,6 +132,84 @@ def makeui(sets, pas = 0):
             if uitype == "RD":
                 output.append(gr.Radio(label=name.replace("_"," "),choices=[x + " " for x in choices] if pas > 0 else choices, value = value, elem_id="tt_" + name,visible = visible))
     return output
+
+_PREVIEW_KEYS = generate_anima_preview_keys()   # generated once at import time
+
+
+def render_layer_preview(filter_str: str) -> str:
+    """Return an HTML snippet showing every canonical Anima LoRA key,
+    highlighted (green) when the current filter selects it or dimmed when it
+    is filtered out.  Blocks are grouped with a small header label.
+    """
+    import re as _re
+
+    # Validate regex — show error banner instead of crashing
+    raw_patterns = [p.strip() for p in _re.split(r'[,\n]+', filter_str or '') if p.strip()]
+    bad_patterns = []
+    for p in raw_patterns:
+        pat = p.lstrip('!')
+        try:
+            _re.compile(pat)
+        except _re.error as e:
+            bad_patterns.append(f"{pat!r}: {e}")
+
+    error_html = ""
+    if bad_patterns:
+        msgs = "<br>".join(bad_patterns)
+        error_html = (
+            f'<div style="color:#f87171;font-family:monospace;font-size:11px;'
+            f'margin-bottom:6px;padding:4px 8px;background:rgba(248,113,113,0.08);'
+            f'border-radius:3px;">Invalid regex — {msgs}</div>'
+        )
+
+    active_count = 0
+    rows = []
+    prev_block = None
+
+    for key in _PREVIEW_KEYS:
+        m = _re.search(r'_blocks_(\d+)_', key)
+        block = f"B{int(m.group(1)):02d}" if m else "BASE"
+
+        if block != prev_block:
+            rows.append(
+                f'<div style="color:#666;font-size:10px;margin-top:6px;margin-bottom:1px;'
+                f'font-family:monospace;letter-spacing:0.08em;">── {block} ──</div>'
+            )
+            prev_block = block
+
+        active = _matches_module_filter(key, filter_str or '')
+        if active:
+            active_count += 1
+            style = (
+                'color:#4ade80;background:rgba(74,222,128,0.09);'
+                'padding:1px 6px;border-radius:2px;display:block;'
+                'margin:1px 0;font-family:monospace;font-size:11px;'
+            )
+        else:
+            style = (
+                'color:#3a3a3a;padding:1px 6px;display:block;'
+                'margin:1px 0;font-family:monospace;font-size:11px;'
+            )
+
+        rows.append(f'<span style="{style}">{key}</span>')
+
+    total = len(_PREVIEW_KEYS)
+    frac_color = '#4ade80' if active_count == total else ('#facc15' if active_count > 0 else '#f87171')
+    header = (
+        f'<div style="font-size:12px;color:#aaa;margin-bottom:6px;font-family:sans-serif;">'
+        f'<span style="color:{frac_color};font-weight:600;">{active_count}</span>'
+        f'<span style="color:#666;">/{total}</span> layers active'
+        f'&nbsp;&nbsp;<span style="color:#555;font-size:10px;">canonical architecture preview</span>'
+        f'</div>'
+    )
+    container = (
+        f'<div style="height:420px;overflow-y:auto;background:#111;border:1px solid #2a2a2a;'
+        f'border-radius:4px;padding:8px 12px;box-sizing:border-box;">'
+        + ''.join(rows)
+        + '</div>'
+    )
+    return error_html + header + container
+
 
 def ToolButton(value="", elem_classes=None, **kwargs):
     elem_classes = elem_classes or []
@@ -208,6 +291,18 @@ def on_ui_tabs():
 
             model_col_grs = [qwen3_gr, t5_gr]
             train_settings_1 = model_col_grs + col1_r1 + col2_r1 + col3_r1 + blocks_grs_1 + col1_o1 + col2_o1 + col3_o1 + col4_o1 + [dummy]
+
+            # --- Layer browser: live regex preview --------------------------------
+            # col4_o1 indices: 0=train_min_timesteps, 1=train_max_timesteps,
+            #                  2=network_module_filter
+            _filter_gr = col4_o1[2]
+            with gr.Row():
+                layer_preview = gr.HTML(
+                    value=render_layer_preview(""),
+                    label="Layer browser",
+                )
+            _filter_gr.change(render_layer_preview, inputs=[_filter_gr], outputs=[layer_preview])
+            # ----------------------------------------------------------------------
 
             with gr.Group(visible=False) as g_diff:
                 gr.HTML(value="Image Pairs (Original → Target)")

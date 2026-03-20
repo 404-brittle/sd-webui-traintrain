@@ -326,8 +326,10 @@ def load_resize_image_and_text(t):
             print("Failed to make sub-buckets; image bucket step or image minimum length is too big?")
 
     for key in t.image_buckets_raw:
-        print(f"bucket {key} has {len(t.image_buckets_raw[key])} images")
-        t.total_images += len(t.image_buckets_raw[key])
+        count = len(t.image_buckets_raw[key])
+        if count > 0:
+            print(f"bucket {key} has {count} images")
+        t.total_images += count
     
 def load_text_files(file_path):
     if file_path is None:
@@ -364,23 +366,24 @@ def encode_image_text(t):
                 t.image_buckets[key] = []
                 for img_path_key in pairdict:
                     if pairdict[img_path_key][4] in pairdict:
-                        image_o = pairdict[img_path_key][5]
-                        image_t = pairdict[pairdict[img_path_key][4]][5]
+                        if getattr(t, 'diff_use_diff_mask', False):
+                            image_o = pairdict[img_path_key][5]
+                            image_t = pairdict[pairdict[img_path_key][4]][5]
 
-                        image_np = np.array(image_o, dtype=np.int16)
-                        image_t_np = np.array(image_t, dtype=np.int16)
+                            image_np = np.array(image_o, dtype=np.int16)
+                            image_t_np = np.array(image_t, dtype=np.int16)
 
-                        mask = image_np - image_t_np
-                        mask = torch.tensor(mask, dtype=torch.float32)
-                        mask = mask.abs().sum(dim=-1)
-                        mask = torch.where(mask > 10, torch.tensor(1, dtype=torch.uint8), torch.tensor(0, dtype=torch.uint8))
+                            mask = image_np - image_t_np
+                            mask = torch.tensor(mask, dtype=torch.float32)
+                            mask = mask.abs().sum(dim=-1)
+                            mask = torch.where(mask > 10, torch.tensor(1, dtype=torch.uint8), torch.tensor(0, dtype=torch.uint8))
 
-                        mask = mask.float()
-                        dilation = 33 # ~4 latent pixels after 8x downsample
-                        mask = F.max_pool2d(mask.unsqueeze(0).unsqueeze(0).cuda(), kernel_size=dilation, stride=1, padding=dilation // 2)[0, 0].cpu()
-                        save_image1(t, mask * 255, "mask", name=img_path_key)
-                        mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(latent.shape[2], latent.shape[3]), mode='nearest')[0, 0]
-                        pairdict[img_path_key][1] = mask
+                            mask = mask.float()
+                            dilation = 33 # ~4 latent pixels after 8x downsample
+                            mask = F.max_pool2d(mask.unsqueeze(0).unsqueeze(0).cuda(), kernel_size=dilation, stride=1, padding=dilation // 2)[0, 0].cpu()
+                            save_image1(t, mask * 255, "mask", name=img_path_key)
+                            mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(latent.shape[2], latent.shape[3]), mode='nearest')[0, 0]
+                            pairdict[img_path_key][1] = mask
                         t.image_buckets[key].append((pairdict[img_path_key][:-2], pairdict[pairdict[img_path_key][4]][:-2]))
 
 def save_images(t,key,images):

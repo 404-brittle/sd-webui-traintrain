@@ -1,0 +1,23 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
+accelerate
+transformers
+diffusers
+gradio
+safetensors
+sentencepiece
+Pillow
+numpy
+pandas
+matplotlib
+tqdm
+packaging
+dadaptation==3.2
+prodigyopt
+wandb
+lycoris_lora
+schedulefree
+pytorch-optimizer
+bitsandbytes>=0.43.0

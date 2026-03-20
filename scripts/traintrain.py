@@ -21,7 +21,7 @@ presetspath = trainer.presetspath
 MODES = ["LoRA", "ADDifT", "Multi-ADDifT"]
 
 # Anima DiT block IDs: BASE (text encoder / global) + B00-B27 (28 transformer blocks)
-from trainer.lora import BLOCKID_ANIMA, generate_anima_preview_keys, _matches_module_filter
+from trainer.lora import generate_anima_preview_keys, _matches_module_filter
 
 PRECISION_TYPES = ["fp32", "bf16", "fp16", "float32", "bfloat16", "float16"]
 NETWORK_TYPES = ["lierla", "c3lier", "loha"]
@@ -101,7 +101,6 @@ network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", 
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
 r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, train_lr_scheduler_settings, save_lora_name, use_gradient_checkpointing]
-row1      = [["network_blocks(BASE = TextEncoder)", "CB", BLOCKID_ANIMA, BLOCKID_ANIMA, list, ALL]]
 
 o_column1 = [image_buckets_step, image_mirroring, image_use_filename_as_tag, image_disable_upscale,
              train_fixed_timsteps_in_batch]
@@ -113,7 +112,7 @@ o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 
-trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + row1 + o_column1 + o_column2 + o_column3 + o_column4
+trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + o_column1 + o_column2 + o_column3 + o_column4
 
 def makeui(sets, pas = 0):
     output = []
@@ -275,9 +274,6 @@ def on_ui_tabs():
                     col2_r1 = makeui(r_column2)
                 with gr.Column(variant="compact"):
                     col3_r1 = makeui(r_column3)
-            with gr.Row():
-                blocks_grs_1 = makeui(row1)
-
             gr.HTML(value="Option Parameters")
             with gr.Row():
                 with gr.Column(variant="compact"):
@@ -290,7 +286,7 @@ def on_ui_tabs():
                     col4_o1 = makeui(o_column4)
 
             model_col_grs = [qwen3_gr, t5_gr]
-            train_settings_1 = model_col_grs + col1_r1 + col2_r1 + col3_r1 + blocks_grs_1 + col1_o1 + col2_o1 + col3_o1 + col4_o1 + [dummy]
+            train_settings_1 = model_col_grs + col1_r1 + col2_r1 + col3_r1 + col1_o1 + col2_o1 + col3_o1 + col4_o1 + [dummy]
 
             # --- Layer browser: live regex preview --------------------------------
             # col4_o1 indices: 0=train_min_timesteps, 1=train_max_timesteps,
@@ -384,10 +380,6 @@ def on_ui_tabs():
             # g_diff (image pair picker) only for single-pair ADDifT
             out.append(gr.update(visible=(mode_idx == 1)))
             return out
-
-        def change_the_block(type, select):
-            blocks = BLOCKID_ANIMA
-            return gr.update(choices=blocks, value=[x for x in select if x in blocks])
 
         def openfolder_f():
             os.startfile(jsonspath)

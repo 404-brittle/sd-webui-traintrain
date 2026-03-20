@@ -14,6 +14,7 @@ from transformers.optimization import AdafactorSchedule
 from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR, CosineAnnealingWarmRestarts, StepLR, MultiStepLR, ReduceLROnPlateau, CyclicLR, OneCycleLR
 from pprint import pprint
 from accelerate import Accelerator
+from trainer.lora import BLOCKID_ANIMA
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 all_configs = []
@@ -114,9 +115,11 @@ class Trainer():
                             val = ast.literal_eval(val)  # リテラル評価で型を適切に変換
                             dvalue[key] = val
                 value = dvalue
-            if set: 
+            if set:
                 setattr(self, sets[0].split("(")[0], value)
-        
+
+        if set:
+            self.network_blocks = list(BLOCKID_ANIMA)
         self.mode_fixer()
         return jdict
 
@@ -405,6 +408,9 @@ def install(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
 def make_accelerator(t):
+    from accelerate.state import AcceleratorState
+    AcceleratorState._reset_state(reset_partial_state=True)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=t.gradient_accumulation_steps,
         mixed_precision=parse_precision(t.train_model_precision, mode = False)

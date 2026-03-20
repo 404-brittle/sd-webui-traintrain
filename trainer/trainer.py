@@ -50,8 +50,8 @@ class Trainer():
         self.logging_verbose        = False
         self.train_lr_scheduler_power = 1.0
         self.sub_image_num          = 0
-        self.image_min_length       = self.image_size[0]  # auto: min side of target resolution
         self.image_max_ratio        = 2.0
+        self.image_min_length       = int(self.image_size[0] / self.image_max_ratio)
         self.network_type           = "lierla"
         self.diff_alt_ratio         = 1.0
 

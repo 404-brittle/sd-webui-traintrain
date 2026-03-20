@@ -9,6 +9,7 @@ import json
 from PIL import Image
 import traceback
 import torch
+import torch.nn.functional as F
 from torch.nn import ModuleList
 from tqdm import tqdm
 from trainer.lora import LoRANetwork, LycorisNetwork
@@ -440,8 +441,9 @@ def train_diff2(t):
             network.set_multiplier(0)
 
             if t.diff_use_diff_mask and "mask" in batch:
-                targ_noise_pred = targ_noise_pred * batch["mask"].to(CUDA)
-                orig_noise_pred = orig_noise_pred * batch["mask"].to(CUDA)
+                mask = F.interpolate(batch["mask"].to(CUDA).unsqueeze(1).float(), size=targ_noise_pred.shape[2:], mode='nearest')
+                targ_noise_pred = targ_noise_pred * mask
+                orig_noise_pred = orig_noise_pred * mask
 
             loss, loss_ema, loss_velocity = process_loss(
                 t, targ_noise_pred, orig_noise_pred, timesteps, loss_ema, loss_velocity

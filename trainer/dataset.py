@@ -1,4 +1,5 @@
 from PIL import Image
+import glob
 import os
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -284,15 +285,14 @@ def load_resize_image_and_text(t):
                 # 新しいサイズを計算（縦横8分の1）
                 new_H, new_W = H // 8, W // 8
                 # マスクを縦横8分の1にリサイズ
-                mask = F.interpolate(alpha_mask.unsqueeze(0).unsqueeze(0), size=(new_H, new_W), mode='nearest')
-                mask = torch.cat([mask]*4, dim=1)
+                mask = F.interpolate(alpha_mask.unsqueeze(0).unsqueeze(0), size=(new_H, new_W), mode='nearest')[0, 0]
             else:
                 # アルファチャンネルがない場合の画像サイズの取得
                 tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
                 _, H, W = tensor.shape  # アルファチャンネルがない場合のためにRGBチャンネルを無視
                 new_H, new_W = H // 8, W // 8  # 新しいサイズを計算（縦横8分の1）
                 # すべて1のテンソルを作成
-                mask = torch.ones((1, 4, new_H, new_W))
+                mask = torch.ones((new_H, new_W))
 
             image = image.convert("RGB")
 
@@ -375,10 +375,12 @@ def encode_image_text(t):
                         mask = mask.abs().sum(dim=-1)
                         mask = torch.where(mask > 10, torch.tensor(1, dtype=torch.uint8), torch.tensor(0, dtype=torch.uint8))
 
-                        mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(latent.shape[2], latent.shape[3]), mode='nearest')
-                        #save_image1(t, mask.squeeze(0) * 255, "mask") 
-
-                        mask = torch.cat([mask] * 4, dim=1)
+                        mask = mask.float()
+                        dilation = 33 # ~4 latent pixels after 8x downsample
+                        mask = F.max_pool2d(mask.unsqueeze(0).unsqueeze(0).cuda(), kernel_size=dilation, stride=1, padding=dilation // 2)[0, 0].cpu()
+                        save_image1(t, mask * 255, "mask", name=img_path_key)
+                        mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(latent.shape[2], latent.shape[3]), mode='nearest')[0, 0]
+                        pairdict[img_path_key][1] = mask
                         t.image_buckets[key].append((pairdict[img_path_key][:-2], pairdict[pairdict[img_path_key][4]][:-2]))
 
 def save_images(t,key,images):
@@ -390,17 +392,17 @@ def save_images(t,key,images):
         image[0].save(ipath)
 
 
-def save_image1(t, image, dirname=""):
+def save_image1(t, image, dirname="", name=None):
     path = os.path.join(t.lora_data_directory, dirname) if dirname else t.lora_data_directory
     os.makedirs(path, exist_ok=True)
-    
+
     if isinstance(image, torch.Tensor):
         image = image.detach().cpu().numpy()
 
     if isinstance(image, np.ndarray):
-        if image.ndim == 3 and image.shape[0] == 1:  
+        if image.ndim == 3 and image.shape[0] == 1:
             image = image.squeeze(0)
-        
+
         if image.ndim == 2:  # 2D配列ならグレースケール画像
             image = Image.fromarray(image.astype(np.uint8), mode='L')
         elif image.ndim == 3:
@@ -411,7 +413,13 @@ def save_image1(t, image, dirname=""):
             raise ValueError(f"Unexpected image shape: {image.shape}")
 
     try:
-        image_path = os.path.join(path, "saved_image.png")
+        if name is not None:
+            stem = os.path.splitext(os.path.basename(name))[0]
+            image_path = os.path.join(path, f"{stem}_mask.png")
+        else:
+            existing = glob.glob(os.path.join(path, "mask_*.png"))
+            idx = len(existing)
+            image_path = os.path.join(path, f"mask_{idx:04d}.png")
         image.save(image_path)
         print(f"Image saved at: {image_path}")
     except Exception as e:

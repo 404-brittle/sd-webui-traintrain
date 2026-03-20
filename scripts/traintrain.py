@@ -92,6 +92,10 @@ train_max_timesteps = ["train_max_timesteps","TX", None, 1000, int,   ALL]
 #            "attn, mlp"           →  attention + MLP only
 #            "attn"                →  attention projections only
 network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", None, "", str, ALL]
+# Layer-wise LR decay: last block trains at base_lr, each earlier block is scaled by decay^depth.
+# 1.0 = disabled (flat LR). 0.9 is a good starting point; lower values are more aggressive.
+LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]
+network_llrd_decay = ["network_llrd_decay", "DD", LLRD_DECAYS, "1.0", float, ALL]
 
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
@@ -103,7 +107,7 @@ o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps]
-o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter]
+o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter, network_llrd_decay]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 

@@ -294,8 +294,10 @@ class LoRANetwork(nn.Module):
         self.te_lr = getattr(t, 'train_textencoder_learning_rate', None) or t.train_learning_rate
 
         self.module = LoRAModule
+        self.is_anima = getattr(t, 'is_anima', False)
+        self.llrd_decay = float(getattr(t, 'network_llrd_decay', 1.0))
 
-        if getattr(t, 'is_anima', False):
+        if self.is_anima:
             t.lora_unet_target = ANIMA_TARGET_REPLACE_MODULE
         elif t.is_dit:
             t.lora_unet_target = MMDIT_TARGET_REPLACE_MODULE
@@ -455,12 +457,46 @@ class LoRANetwork(nn.Module):
             all_params.append(param_data)
 
         if self.unet_loras:
-            params = []
-            [params.extend(lora.parameters()) for lora in self.unet_loras]
-            param_data = {'params': params}
-            if self.unet_lr is not None:
-                param_data['lr'] = self.unet_lr
-            all_params.append(param_data)
+            if self.is_anima and self.llrd_decay != 1.0:
+                # Layer-wise Learning Rate Decay (LLRD):
+                # Group LoRA modules by block index, then apply a geometric LR
+                # multiplier so the last block trains at base_lr and each earlier
+                # block is scaled down by decay^(max_block - block_idx).
+                # This compensates for uneven gradient magnitudes across depth.
+                block_loras = {}  # block_idx (int) -> [loras]
+                unmatched = []
+                for lora in self.unet_loras:
+                    m = re.search(r'_blocks_(\d+)_', lora.lora_name)
+                    if m:
+                        block_loras.setdefault(int(m.group(1)), []).append(lora)
+                    else:
+                        unmatched.append(lora)
+
+                if block_loras:
+                    max_block = max(block_loras.keys())
+                    lr_min = self.unet_lr * (self.llrd_decay ** max_block)
+                    lr_max = self.unet_lr
+                    print(f"LLRD: {len(block_loras)} block groups, decay={self.llrd_decay}, "
+                          f"LR range [{lr_min:.2e} – {lr_max:.2e}]")
+                    for block_idx in sorted(block_loras.keys()):
+                        depth = max_block - block_idx
+                        block_lr = self.unet_lr * (self.llrd_decay ** depth)
+                        print(f"block_idx: {block_idx}, depth={depth}, block_lr={block_lr}")
+                        params = []
+                        [params.extend(lora.parameters()) for lora in block_loras[block_idx]]
+                        all_params.append({'params': params, 'lr': block_lr})
+
+                if unmatched:
+                    params = []
+                    [params.extend(lora.parameters()) for lora in unmatched]
+                    all_params.append({'params': params, 'lr': self.unet_lr})
+            else:
+                params = []
+                [params.extend(lora.parameters()) for lora in self.unet_loras]
+                param_data = {'params': params}
+                if self.unet_lr is not None:
+                    param_data['lr'] = self.unet_lr
+                all_params.append(param_data)
 
         return all_params
 

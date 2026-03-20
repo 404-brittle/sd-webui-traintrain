@@ -24,8 +24,10 @@ POs = ["came", "tiger", "adammini"]
 
 path_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 jsonspath = os.path.join(path_root,"jsons")
+os.makedirs(jsonspath, exist_ok=True)
 logspath = os.path.join(path_root,"logs")
 presetspath = os.path.join(path_root,"presets")
+os.makedirs(presetspath, exist_ok=True)
 
 class Trainer():
     def __init__(self, jsononly, model, vae, mode, values):

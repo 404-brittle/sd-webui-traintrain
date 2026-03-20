@@ -1,10 +1,5 @@
 import os
-import pandas as pd
-import matplotlib.pyplot as plt
 import gradio as gr
-from PIL import Image, ImageChops
-import random
-import numpy as np
 try:
     from modules import script_callbacks
     _HAS_WEBUI = True
@@ -238,8 +233,6 @@ def on_ui_tabs():
                 stop_save = gr.Button(value="Stop and Save", elem_classes=["compact_button"], variant='primary')
             with gr.Row():
                 with gr.Column():
-                    queue = gr.Button(value="Add to Queue", elem_classes=["compact_button"], variant='primary')
-                with gr.Column():
                     with gr.Row():
                         presets = gr.Dropdown(choices=load_preset(None), show_label=False, elem_id="tt_preset")
                         loadpreset = ToolButton(value=load_symbol)
@@ -308,48 +301,6 @@ def on_ui_tabs():
                     with gr.Column():
                         targ_image = gr.Image(label="Target Image", interactive=True)
 
-        with gr.Tab("Queue"):
-            with gr.Row():
-                reload_queue = gr.Button(value="Reload Queue", elem_classes=["compact_button"], variant='primary')
-                delete_queue = gr.Button(value="Delete Queue", elem_classes=["compact_button"], variant='primary')
-                delete_name = gr.Textbox(label="Name of Queue to delete")
-            with gr.Row():
-                queue_list = gr.DataFrame(headers=["Name", "Mode", "Model", "VAE"] + [x[0] for x in trainer.all_configs])
-
-        with gr.Tab("Plot"):
-            with gr.Row():
-                reload_plot = gr.Button(value="Reload Plot", elem_classes=["compact_button"], variant='primary')
-                plot_file = gr.Textbox(label="Name of logfile, blank for last or current training")
-            with gr.Row():
-                plot = gr.Plot()
-
-        with gr.Tab("Image"):
-            gr.HTML(value="Rotate random angle and scaling")
-            image_result = gr.Textbox(label="Message")
-            with gr.Row():
-                with gr.Column(variant="compact"):
-                    angle_bg = gr.Button(value="From Directory", elem_classes=["compact_button"], variant='primary')
-                with gr.Column(variant="compact"):
-                    angle_bg_i = gr.Button(value="From File", elem_classes=["compact_button"], variant='primary')
-                with gr.Column(variant="compact"):
-                    fix_side = gr.Radio(label="fix side", value="none", choices=["none", "right", "left", "top", "bottom"])
-            with gr.Row():
-                with gr.Column(variant="compact"):
-                    image_dir = gr.Textbox(label="Image directory")
-                with gr.Column(variant="compact"):
-                    output_name = gr.Textbox(label="Output name")
-                with gr.Column(variant="compact"):
-                    save_dir = gr.Textbox(label="Output directory")
-            with gr.Row():
-                num_of_images = gr.Slider(label="number of images", maximum=1000, minimum=0, step=1, value=5)
-                max_tilting_angle = gr.Slider(label="max_tilting_angle", maximum=180, minimum=0, step=1, value=180)
-                min_scale = gr.Slider(label="minimun downscale ratio", maximum=1, minimum=0, step=0.01, value=0.4)
-            with gr.Row():
-                change_angle = gr.Checkbox(label="change angle", value=False)
-                change_scale = gr.Checkbox(label="change scale", value=False)
-
-            input_image = gr.Image(label="Input Image", interactive=True, type="pil", image_mode="RGBA")
-
         dtrue = gr.Checkbox(value=True, visible=False)
         dfalse = gr.Checkbox(value=False, visible=False)
 
@@ -359,16 +310,9 @@ def on_ui_tabs():
             train.train(*args)
             return gr.update(choices=load_preset(None))
 
-        angle_bg.click(change_angle_bg, [dtrue, image_dir, save_dir, input_image, output_name, num_of_images, change_angle, max_tilting_angle, change_scale, min_scale, fix_side], [image_result])
-        angle_bg_i.click(change_angle_bg, [dfalse, image_dir, save_dir, input_image, output_name, num_of_images, change_angle, max_tilting_angle, change_scale, min_scale, fix_side], [image_result])
-
         start.click(train.train, [dfalse, mode, model, vae, *train_settings_1, *in_images], [result])
-        queue.click(train.queue, [dfalse, mode, model, vae, *train_settings_1, *in_images], [result])
         savepreset.click(savepreset_f, [dtrue, mode, model, vae, *train_settings_1, *in_images], [presets])
         refleshpreset.click(lambda: gr.update(choices=load_preset(None)), outputs=[presets])
-
-        reload_queue.click(train.get_del_queue_list, outputs=queue_list)
-        delete_queue.click(train.get_del_queue_list, inputs=[delete_name], outputs=queue_list)
 
         stop.click(train.stop_time, [dfalse], [result])
         stop_save.click(train.stop_time, [dtrue], [result])
@@ -389,168 +333,7 @@ def on_ui_tabs():
         mode.change(change_the_mode, [mode], [*train_settings_1, g_diff])
         openfolder.click(openfolder_f)
 
-        reload_plot.click(plot_csv, [plot_file], [plot])
-
     return (ui, "TrainTrain", "TrainTrain"),
-
-def plot_csv(csv_path, logspath="."):
-    def get_csv(csv_path):
-        csv_path = csv_path if ".csv" in csv_path else csv_path + ".csv"
-        if csv_path:
-            for root, dirs, files in os.walk(logspath):
-                if csv_path in files:
-                    return os.path.join(root, csv_path)
-
-        # 指定されたファイルが見つからない場合、最新の CSV ファイルを探す
-        latest_csv = None
-        latest_time = 0
-
-        for root, dirs, files in os.walk(logspath):
-            for file in files:
-                if file.endswith(".csv"):
-                    file_path = os.path.join(root, file)
-                    file_time = os.path.getmtime(file_path)
-
-                    if file_time > latest_time:
-                        latest_csv = file_path
-                        latest_time = file_time
-
-        return latest_csv
-
-    csv_file = get_csv(csv_path)
-
-    # **"Step" から始まる行を見つける**
-    header_row = 0  # デフォルトは0行目
-    with open(csv_file, "r") as f:
-        for i, line in enumerate(f):
-            if line.startswith("Step"):
-                header_row = i
-                break  # "Step" が見つかったら終了
-
-    # **CSVを適切なヘッダー行から読み込む**
-    df = pd.read_csv(csv_file, skiprows=header_row)
-
-    # x 軸にするカラム名（通常 "Step"）
-    x = df.columns[0]
-
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-
-    # 主要な y 軸 (2 列目)
-    color = 'tab:red'
-    ax1.set_xlabel(x)
-    ax1.set_ylabel(df.columns[1], color=color)
-    ax1.plot(df[x], df[df.columns[1]], color=color)
-    ax1.tick_params(axis='y', labelcolor=color)
-
-    # 追加の y 軸 (3 列目以降)
-    ax2 = ax1.twinx()
-    color = 'tab:blue'
-    ax2.set_ylabel('Learning Rates', color=color)
-    for column in df.columns[2:]:
-        ax2.plot(df[x], df[column], label=column)
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    plt.title("Training Result")
-    fig.tight_layout()
-    plt.legend()
-    plt.grid(True)
-
-    return plt.gcf()
-
-
-# ここに必要な追加の関数を定義します。
-def downscale_image(image, min_scale, fix_side=None):
-    import random
-    from PIL import Image
-
-    scale = random.uniform(min_scale, 1)
-    original_size = image.size
-    new_size = (int(original_size[0] * scale), int(original_size[1] * scale))
-    downscaled_image = image.resize(new_size, Image.ANTIALIAS)
-    new_image = Image.new("RGBA", original_size, (0, 0, 0, 0))
-
-    # 配置位置を決定する
-    if fix_side == "right":
-        x_position = original_size[0] - new_size[0]
-        y_position = random.randint(0, original_size[1] - new_size[1])
-    elif fix_side == "top":
-        x_position = random.randint(0, original_size[0] - new_size[0])
-        y_position = 0
-    elif fix_side == "left":
-        x_position = 0
-        y_position = random.randint(0, original_size[1] - new_size[1])
-    elif fix_side == "bottom":
-        x_position = random.randint(0, original_size[0] - new_size[0])
-        y_position = original_size[1] - new_size[1]
-    else:
-        # fix_sideがNoneまたは無効な値の場合、ランダムな位置に配置
-        x_position = random.randint(0, original_size[0] - new_size[0])
-        y_position = random.randint(0, original_size[1] - new_size[1])
-
-    new_image.paste(downscaled_image, (x_position, y_position))
-    return new_image
-
-
-MARGIN = 5
-
-def marginer(bbox, image):
-    return (
-        max(bbox[0] - MARGIN, 0),  # 左
-        max(bbox[1] - MARGIN, 0),  # 上
-        min(bbox[2] + MARGIN, image.width),  # 右
-        min(bbox[3] + MARGIN, image.height)  # 下
-    )
-
-
-def change_angle_bg(from_dir, image_dir, save_dir, input_image, output_name, num_of_images ,
-                                change_angle, max_tilting_angle, change_scale, min_scale, fix_side):
-
-    if from_dir:
-        image_files = [file for file in os.listdir(image_dir) if file.endswith((".png", ".jpg", ".jpeg"))]
-    else:
-        image_files = [input_image]
-
-    for file in image_files:
-        if isinstance(file, str):
-            modified_folder_path = os.path.join(image_dir, "modified")
-            os.makedirs(modified_folder_path, exist_ok=True)
-
-            path = os.path.join(image_dir, file)
-            name, extention = os.path.splitext(file)
-            with Image.open(path) as img:
-                img = img.convert("RGBA")
-        else:
-            modified_folder_path = save_dir
-            os.makedirs(modified_folder_path, exist_ok=True)
-
-            img = file
-            name = output_name
-            extention = "png"
-
-        for i in range(num_of_images):
-            modified_img = img
-
-            #画像を回転
-            if change_angle:
-                angle = random.uniform(-max_tilting_angle, max_tilting_angle)
-                modified_img = modified_img.rotate(angle, expand=True)
-
-            if change_scale:
-                modified_img = downscale_image(modified_img, min_scale, fix_side)
-
-            # 変更した画像を保存
-            save_path = os.path.join(modified_folder_path, f"{name}_id_{i}.{extention}")
-            modified_img.save(save_path)
-
-    return f"Images saved in {modified_folder_path}"
-
-
-def getjsonlist():
-    if not os.path.isdir(jsonspath):
-        return []
-    json_files = [f for f in os.listdir(jsonspath) if f.endswith('.json')]
-    json_files = [f.replace(".json", "") for f in json_files]
-    return json_files
 
 if _HAS_WEBUI and __package__ == "traintrain":
     script_callbacks.on_ui_tabs(on_ui_tabs)

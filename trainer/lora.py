@@ -296,6 +296,8 @@ class LoRANetwork(nn.Module):
         self.module = LoRAModule
         self.is_anima = getattr(t, 'is_anima', False)
         self.llrd_decay = float(getattr(t, 'network_llrd_decay', 1.0))
+        self.ortho_reg_weight = float(getattr(t, 'network_ortho_reg_weight', 0.0))
+        self.spectral_norm_cap = float(getattr(t, 'network_spectral_norm_cap', 0.0))
 
         if self.is_anima:
             t.lora_unet_target = ANIMA_TARGET_REPLACE_MODULE
@@ -546,6 +548,48 @@ class LoRANetwork(nn.Module):
     def __exit__(self, exc_type, exc_value, tb):
         for lora in self.unet_loras + self.te_loras:
             lora.multiplier = 0
+
+    def ortho_reg_loss(self):
+        """Penalise W_down @ W_down.T deviating from the identity matrix.
+
+        Encourages the rows of each lora_down to be orthonormal, keeping the
+        learned subspace well-conditioned and reducing high-frequency frying
+        artefacts caused by collinear or dominant projection directions.
+        Computed in fp32 for numerical stability regardless of training dtype.
+        """
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for lora in self.unet_loras + self.te_loras:
+            if not isinstance(lora.lora_down, nn.Linear):
+                continue
+            W = lora.lora_down.weight.float()           # [rank, in_dim]
+            gram = W @ W.T                               # [rank, rank]
+            identity = torch.eye(lora.lora_dim, device=W.device)
+            loss = loss + torch.norm(gram - identity, p='fro')
+        return self.ortho_reg_weight * loss
+
+    def apply_spectral_norm_cap(self):
+        """Clamp the largest singular value of each lora_down weight matrix.
+
+        Prevents any single direction in the projection subspace from growing
+        unboundedly, which is the direct cause of the frying effect.
+        Applied after each optimiser step; skips modules whose spectral norm
+        is already within the cap to avoid unnecessary SVD overhead.
+        Operates on fp32 copies and writes back in the original dtype.
+        """
+        cap = self.spectral_norm_cap
+        with torch.no_grad():
+            for lora in self.unet_loras + self.te_loras:
+                if not isinstance(lora.lora_down, nn.Linear):
+                    continue
+                W = lora.lora_down.weight.data
+                W_f = W.float()                          # [rank, in_dim]
+                U, S, Vh = torch.linalg.svd(W_f, full_matrices=False)
+                if S.max().item() <= cap:
+                    continue
+                S_clamped = S.clamp(max=cap)
+                lora.lora_down.weight.data.copy_(
+                    ((U * S_clamped.unsqueeze(0)) @ Vh).to(W.dtype)
+                )
 
     def check_weight(self, te = False):
         sums = []

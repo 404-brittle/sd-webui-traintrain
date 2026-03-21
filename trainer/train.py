@@ -316,8 +316,15 @@ def train_lora(t):
                             [x.cpu().item() if isinstance(x, torch.Tensor) else x for x in lr_scheduler.get_last_lr()],
                             t.csvpath)
 
+                if network.ortho_reg_weight > 0:
+                    loss = loss + network.ortho_reg_loss()
+
                 t.a.backward(loss)
                 optimizer.step()
+
+                if network.spectral_norm_cap > 0:
+                    network.apply_spectral_norm_cap()
+
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
@@ -461,8 +468,15 @@ def train_diff2(t):
                         [x.cpu().item() if isinstance(x, torch.Tensor) else x for x in lr_scheduler.get_last_lr()],
                         t.csvpath)
 
+            if network.ortho_reg_weight > 0:
+                loss = loss + network.ortho_reg_loss()
+
             t.a.backward(loss)
             optimizer.step()
+
+            if network.spectral_norm_cap > 0:
+                network.apply_spectral_norm_cap()
+
             lr_scheduler.step()
             optimizer.zero_grad()
 

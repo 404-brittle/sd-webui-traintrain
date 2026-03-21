@@ -96,6 +96,12 @@ network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", 
 # 1.0 = disabled (flat LR). 0.9 is a good starting point; lower values are more aggressive.
 LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]
 network_llrd_decay = ["network_llrd_decay", "DD", LLRD_DECAYS, "1.0", float, ALL]
+# Orthogonality regularisation: penalises lora_down rows becoming collinear (0.0 = disabled).
+# Added to the main loss each step. Start with 1e-3; increase if frying persists.
+network_ortho_reg_weight = ["network_ortho_reg_weight(0=off)", "TX", None, "0.0", float, ALL]
+# Spectral norm cap: clamps the largest singular value of each lora_down after each step (0.0 = disabled).
+# A value of ~1.0 is a soft constraint; lower values are more aggressive.
+network_spectral_norm_cap = ["network_spectral_norm_cap(0=off)", "TX", None, "0.0", float, ALL]
 
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
@@ -107,7 +113,8 @@ o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps]
-o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter, network_llrd_decay]
+o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter, network_llrd_decay,
+             network_ortho_reg_weight, network_spectral_norm_cap]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 

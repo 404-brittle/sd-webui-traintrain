@@ -97,15 +97,18 @@ network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", 
 LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]
 network_llrd_decay = ["network_llrd_decay", "DD", LLRD_DECAYS, "1.0", float, ALL]
 
-# Subspace guard: gradient projection to prevent learning features from a reference subspace.
-# Set subspace_guard_path to a .safetensors file produced by tools/extract_subspace.py.
-# Multiple files can be comma-separated (e.g. "subspaces/style.safetensors,subspaces/subject.safetensors").
-# subspace_guard_strength controls how aggressively the projection is applied (0.0–1.0, default 1.0).
+# Subspace guard: gradient projection to prevent (exclude) or constrain to (include) a reference subspace.
+# One entry per line:
+#   exclude: subspaces/style.safetensors        — block these directions (default for bare paths)
+#   include: subspaces/concept.safetensors      — restrict learning to this subspace
+#   exclude: subspaces/soft.safetensors:0.5     — per-entry strength override
+# Old comma-separated bare-path format is still accepted (all treated as exclude).
+# subspace_guard_strength sets the global exclude strength (0.0–1.0); per-entry :strength overrides it.
 GUARD_STRENGTHS = ["1.0", "0.9", "0.75", "0.5", "0.25", "0.0"]
-subspace_guard_path             = ["subspace_guard_path",             "TX", None,           "",    str,   ALL]
+subspace_guard_path             = ["subspace_guard_path",             "TA", None,           "",    str,   ALL]
 subspace_guard_strength         = ["subspace_guard_strength",         "DD", GUARD_STRENGTHS, "1.0", float, ALL]
-# When enabled, layers that have no subspace mapping are fully blocked (gradient zeroed).
-# Only layers present in the subspace file will be trained.
+# When enabled, layers absent from all listed subspace files are excluded at network creation.
+# Reduces LoRA file size and VRAM to only the mapped layers.
 subspace_guard_restrict_to_mapped = ["subspace_guard_restrict_to_mapped", "CH", None, False, bool, ALL]
 
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
@@ -135,6 +138,8 @@ def makeui(sets, pas = 0):
                 output.append(gr.Dropdown(label=name.replace("_"," "), choices=choices, value=value if value else choices[0] , elem_id="tt_" + name, visible = visible))
             if uitype == "TX":
                 output.append(gr.Textbox(label=name.replace("_"," "),value = value, elem_id="tt_" +add_id + name, visible = visible))
+            if uitype == "TA":
+                output.append(gr.Textbox(label=name.replace("_"," "),value = value, elem_id="tt_" +add_id + name, visible = visible, lines=5))
             if uitype == "CH":
                 output.append(gr.Checkbox(label=name.replace("_"," "),value = value, elem_id="tt_" + name, visible = visible))
             if uitype == "CB":

@@ -2,62 +2,159 @@
 
 Gradient projection guard for LoRA training.
 
-Registers backward hooks on lora_down.weight for every matching LoRA layer that
-project the gradient to be orthogonal to a pre-computed "protected" subspace.
-This prevents a new LoRA from learning features already encoded by a reference
-feature type (e.g. preventing a style LoRA from also encoding subject identity).
+Each entry in the guard config maps a subspace file to one of two modes:
 
-Typical usage
--------------
-    # After create_network(t) in train_lora / train_diff2:
-    guard = SubspaceGuard.from_file("subspaces/subject.safetensors", strength=1.0)
-    guard.register_gradient_hooks(network)
+  exclude  (default)
+      Projects the gradient *orthogonal* to the specified subspace.
+      The LoRA cannot learn directions already encoded by the reference feature.
+      Example: exclude a style subspace so the new LoRA only captures
+      subject identity, not style.
 
-    # ... training loop runs normally ...
+  include
+      Projects the gradient *into* the specified subspace.
+      The LoRA can only learn within this subspace.
+      Example: include a concept subspace to constrain a fine-tune to a
+      pre-defined direction.
 
-    guard.remove_hooks()   # optional clean-up at end of training
+When both modes are present for a layer, include is applied first (constraining
+the gradient to the include space), then exclude removes specific sub-directions
+from within that constrained space.
 
-Multiple guards can be stacked (one per feature type to protect):
-    style_guard   = SubspaceGuard.from_file("subspaces/style.safetensors",   strength=1.0)
-    subject_guard = SubspaceGuard.from_file("subspaces/subject.safetensors", strength=1.0)
-    style_guard.register_gradient_hooks(network)
-    subject_guard.register_gradient_hooks(network)
+Multiple files of the same mode are merged per-layer: their V_K matrices are
+concatenated along the K axis and re-orthogonalised via a thin SVD so the
+combined subspace is a proper orthonormal basis.
+
+Config format (subspace_guard_path field, one entry per line)
+-------------------------------------------------------------
+    exclude: subspaces/style.safetensors
+    exclude: subspaces/expressions.safetensors:0.75
+    include: subspaces/my_concept.safetensors
+
+    # bare path → exclude, strength from global setting
+    subspaces/style.safetensors
+
+Comma-separated bare paths (old format) are still accepted for backward
+compatibility:
+    subspaces/style.safetensors,subspaces/subject.safetensors
+
+Per-entry strength override (append :float after the path):
+    exclude: subspaces/soft_style.safetensors:0.5
 
 Background
 ----------
-Each reference subspace file (produced by tools/extract_subspace.py) contains,
-for every LoRA layer key, the top-K right singular vectors of the stacked
-lora_down.weight matrices from all reference LoRAs.  These K vectors span the
-principal input-space directions occupied by the reference feature type.
+Each subspace file (produced by tools/extract_subspace.py or
+tools/extract_subspace_from_model.py) stores, for every LoRA layer key, the
+top-K right singular vectors of the stacked weight/gradient matrices.  These K
+vectors span the principal input-space directions of the reference feature type.
 
-For a gradient g of shape (r, n) on lora_down.weight, the projection is:
+For grad of shape (r, n) and V_K of shape (n, K):
 
-    g_protected = g @ V_K @ V_K^T   (component lying in the protected subspace)
-    g_filtered  = g - strength * g_protected
+  Include projection (restrict to subspace):
+      g = (g @ V_K) @ V_K^T
 
-With strength=1.0 the filtered gradient has zero component in every protected
-direction, so the optimiser cannot step the LoRA weights into that subspace.
-With strength<1.0 a fraction of the protected gradient is still allowed through,
-which can help convergence when the subspaces are not perfectly orthogonal.
+  Exclude projection (remove subspace component):
+      g = g - strength * (g @ V_K) @ V_K^T
 """
 
 from __future__ import annotations
 
 import os
+import re
 import torch
 from safetensors.torch import load_file
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _load_vk_from_file(path: str, device: str = "cpu") -> dict[str, torch.Tensor]:
+    """Load {lora_name: V_K Tensor(n, K)} from a subspace .safetensors file."""
+    flat = load_file(path, device=device)
+    result: dict = {}
+    for key, tensor in flat.items():
+        if key.endswith(".V_K"):
+            result[key[: -len(".V_K")]] = tensor
+    return result
+
+
+def _merge_vk_list(vk_list: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate a list of V_K tensors and re-orthogonalise.
+
+    All tensors must have the same n (input dimension).
+    Returns an orthonormal (n, rank) basis for the union of the subspaces.
+    """
+    if len(vk_list) == 1:
+        return vk_list[0]
+    combined = torch.cat(vk_list, dim=1).float()  # (n, K_total)
+    _, _, Vh = torch.linalg.svd(combined.T, full_matrices=False)
+    # Vh: (rank, n) → transpose to (n, rank)
+    return Vh.T.half().cpu().contiguous()
+
+
+def _parse_guard_entries(raw: str) -> list[tuple[str, str, float | None]]:
+    """Parse the subspace_guard_path field into a list of (path, mode, strength|None).
+
+    Supported formats (one entry per line, or comma-separated for old compat):
+
+        exclude: subspaces/style.safetensors
+        include: subspaces/concept.safetensors
+        subspaces/style.safetensors          # bare path → exclude
+        exclude: subspaces/soft.safetensors:0.5  # per-entry strength override
+
+    Blank lines and # comments are ignored.
+    """
+    entries: list = []
+    # Support both newline and comma separators
+    for line in re.split(r"[,\n]", raw):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # Detect mode prefix: "exclude: ..." or "include: ..."
+        m = re.match(r"^(exclude|include)\s*:\s*(.+)$", line, re.IGNORECASE)
+        if m:
+            mode = m.group(1).lower()
+            rest = m.group(2).strip()
+        else:
+            mode = "exclude"
+            rest = line
+
+        # Detect optional per-entry strength suffix: "path.safetensors:0.75"
+        # But be careful not to split Windows drive letters (C:\...)
+        strength: float | None = None
+        strength_m = re.search(r":([01](?:\.\d+)?)$", rest)
+        if strength_m:
+            try:
+                strength = float(strength_m.group(1))
+                rest = rest[: strength_m.start()].strip()
+            except ValueError:
+                pass
+
+        if rest:
+            entries.append((rest, mode, strength))
+
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Main guard class
+# ---------------------------------------------------------------------------
+
 class SubspaceGuard:
-    """Project LoRA gradients orthogonal to a reference feature subspace.
+    """Gradient projection guard supporting include and exclude subspace modes.
 
     Args:
         subspaces:  dict mapping lora_name (base key) to
-                    {"V_K": Tensor(n, K)}  principal input-space directions.
-        strength:   float in [0, 1].
-                    1.0 = full projection (zero gradient in protected directions).
-                    0.0 = no projection (guard is a no-op).
-        label:      Optional human-readable name for logging (e.g. "subject").
+                    {"V_exc": Tensor(n, K)|None,
+                     "V_inc": Tensor(n, K)|None,
+                     "strength_exc": float (per-layer override, or None → use self.strength)}
+        strength:   Global exclude strength in [0, 1].
+                    1.0 = full projection.  0.0 = no projection.
+        label:      Human-readable name for logging.
+        restrict_to_mapped:
+                    When True, layers absent from the subspace dict were excluded
+                    at network creation time and will not appear in the network.
     """
 
     def __init__(
@@ -73,11 +170,73 @@ class SubspaceGuard:
         self.restrict_to_mapped = restrict_to_mapped
         self._hooks: list = []
         self._projected_layers: int = 0
-        self._blocked_layers: int = 0
 
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
+
+    @classmethod
+    def from_entries(
+        cls,
+        entries: list[tuple[str, str, float | None]],
+        strength: float = 1.0,
+        label: str = "combined",
+        device: str = "cpu",
+        restrict_to_mapped: bool = False,
+    ) -> "SubspaceGuard":
+        """Build a guard from a list of (path, mode, per_entry_strength|None) tuples.
+
+        Files with mode "exclude" are merged into a per-layer exclude subspace.
+        Files with mode "include" are merged into a per-layer include subspace.
+        """
+        exc_vks: dict[str, list[torch.Tensor]] = {}  # name → [V_K, ...]
+        inc_vks: dict[str, list[torch.Tensor]] = {}
+        exc_strength_override: dict[str, float] = {}  # name → per-entry strength
+
+        n_exc = sum(1 for _, m, _ in entries if m == "exclude")
+        n_inc = sum(1 for _, m, _ in entries if m == "include")
+
+        for path, mode, entry_strength in entries:
+            vks = _load_vk_from_file(path, device=device)
+            stem = os.path.splitext(os.path.basename(path))[0]
+            print(
+                f"SubspaceGuard [{label}]: [{mode}] {stem} — "
+                f"{len(vks)} layers"
+                + (f", strength={entry_strength:.3f}" if entry_strength is not None else "")
+            )
+            if mode == "exclude":
+                for name, vk in vks.items():
+                    exc_vks.setdefault(name, []).append(vk)
+                    # Per-entry strength override: use the last seen if multiple
+                    # files contribute to the same layer
+                    if entry_strength is not None:
+                        exc_strength_override[name] = entry_strength
+            else:
+                for name, vk in vks.items():
+                    inc_vks.setdefault(name, []).append(vk)
+
+        all_names: set[str] = set(exc_vks) | set(inc_vks)
+        subspaces: dict = {}
+        for name in all_names:
+            V_exc = _merge_vk_list(exc_vks[name]) if name in exc_vks else None
+            V_inc = _merge_vk_list(inc_vks[name]) if name in inc_vks else None
+            subspaces[name] = {
+                "V_exc": V_exc,
+                "V_inc": V_inc,
+                "strength_exc": exc_strength_override.get(name),  # None → use global
+            }
+
+        mode_summary = []
+        if n_exc:
+            mode_summary.append(f"{n_exc} exclude")
+        if n_inc:
+            mode_summary.append(f"{n_inc} include")
+        print(
+            f"SubspaceGuard [{label}]: "
+            f"{' + '.join(mode_summary)} files → {len(subspaces)} layer entries "
+            f"(global strength={strength:.3f}, restrict_to_mapped={restrict_to_mapped})"
+        )
+        return cls(subspaces, strength=strength, label=label, restrict_to_mapped=restrict_to_mapped)
 
     @classmethod
     def from_file(
@@ -88,30 +247,14 @@ class SubspaceGuard:
         device: str = "cpu",
         restrict_to_mapped: bool = False,
     ) -> "SubspaceGuard":
-        """Load a subspace file produced by tools/extract_subspace.py.
-
-        Args:
-            path:     Path to the .safetensors subspace file.
-            strength: Projection strength in [0, 1].
-            label:    Human-readable name; defaults to the file stem.
-            device:   Device to load tensors onto (they are moved to the
-                      gradient device at hook time, so "cpu" is fine).
-        """
+        """Load a single subspace file as an exclude guard (backward-compatible)."""
         if label is None:
             label = os.path.splitext(os.path.basename(path))[0]
-
-        flat = load_file(path, device=device)
-        subspaces: dict = {}
-        for key, tensor in flat.items():
-            if key.endswith(".V_K"):
-                base = key[: -len(".V_K")]
-                subspaces[base] = {"V_K": tensor}
-
-        print(
-            f"SubspaceGuard [{label}]: loaded {len(subspaces)} layer subspaces "
-            f"from {path} (strength={strength:.3f}, restrict_to_mapped={restrict_to_mapped})"
+        return cls.from_entries(
+            [(path, "exclude", None)],
+            strength=strength, label=label, device=device,
+            restrict_to_mapped=restrict_to_mapped,
         )
-        return cls(subspaces, strength=strength, label=label, restrict_to_mapped=restrict_to_mapped)
 
     @classmethod
     def from_files(
@@ -122,89 +265,60 @@ class SubspaceGuard:
         device: str = "cpu",
         restrict_to_mapped: bool = False,
     ) -> "SubspaceGuard":
-        """Merge multiple subspace files into one guard.
-
-        The V_K matrices from each file are concatenated per layer and
-        re-orthogonalised via a thin SVD so the combined subspace has at
-        most K*len(paths) orthonormal directions.  Useful for protecting
-        against multiple feature types simultaneously.
-
-        Args:
-            paths:   List of subspace .safetensors file paths.
-            strength, label, device: as for from_file.
-        """
-        # Load all subspaces
-        per_file: list[dict] = [
-            cls.from_file(p, strength=1.0, device=device).subspaces for p in paths
-        ]
-
-        # Union of layer keys
-        all_keys: set[str] = set()
-        for d in per_file:
-            all_keys.update(d.keys())
-
-        merged: dict = {}
-        for key in all_keys:
-            vks = [d[key]["V_K"] for d in per_file if key in d]
-            if not vks:
-                continue
-            # Concatenate along the K axis: (n, K1), (n, K2) → (n, K1+K2)
-            combined = torch.cat(vks, dim=1)
-            # Re-orthogonalise: SVD of combined^T gives orthonormal rows
-            _, _, Vh = torch.linalg.svd(combined.T.float(), full_matrices=False)
-            # Vh: (rank, n) → take as rows, transpose back to (n, rank)
-            merged[key] = {"V_K": Vh.T.half().cpu()}
-
-        print(
-            f"SubspaceGuard [{label}]: merged {len(paths)} subspace files → "
-            f"{len(merged)} combined layer subspaces (strength={strength:.3f})"
+        """Merge multiple subspace files as exclude guards (backward-compatible)."""
+        return cls.from_entries(
+            [(p, "exclude", None) for p in paths],
+            strength=strength, label=label, device=device,
+            restrict_to_mapped=restrict_to_mapped,
         )
-        inst = cls(merged, strength=strength, label=label, restrict_to_mapped=restrict_to_mapped)
-        return inst
 
     # ------------------------------------------------------------------
     # Hook management
     # ------------------------------------------------------------------
 
-    def _make_projection_hook(self, V_K: torch.Tensor):
-        """Return a gradient hook that projects rows of grad orthogonal to V_K.
+    def _make_projection_hook(
+        self,
+        V_exc: torch.Tensor | None,
+        V_inc: torch.Tensor | None,
+        strength_exc: float | None,
+    ):
+        """Return a backward hook applying include then exclude projections.
 
-        V_K must already be on the same device as the gradient (moved at
-        registration time, not inside the hook).  Only a dtype cast is done
-        at hook call time, which is a cheap in-place GPU operation.
+        Both tensors are already on the gradient device (moved at registration
+        time).  Only a dtype cast happens inside the hook — no device transfers.
 
-        For grad of shape (r, n) and V_K of shape (n, K):
-            proj = grad @ V_K @ V_K^T   — component in protected subspace
-            return grad - strength * proj
+        Projection order:
+            1. Include (if any):  g = (g @ V_inc) @ V_inc^T
+               Restricts gradient to the include subspace.
+            2. Exclude (if any):  g = g - strength * (g @ V_exc) @ V_exc^T
+               Removes the excluded directions from the (possibly restricted) gradient.
         """
-        strength = self.strength
+        global_strength = self.strength
+        eff_strength = global_strength if strength_exc is None else float(strength_exc)
 
         def hook(grad: torch.Tensor) -> torch.Tensor:
-            if grad is None or strength == 0.0:
+            if grad is None:
                 return grad
-            # V_K is already on grad.device — only cast dtype (fast, on-GPU)
-            vk = V_K.to(dtype=grad.dtype)
-            # (r, n) @ (n, K) → (r, K);  (r, K) @ (K, n) → (r, n)
-            proj = (grad @ vk) @ vk.t()
-            return grad - strength * proj
+            g = grad
+            if V_inc is not None:
+                vk_inc = V_inc.to(dtype=g.dtype)
+                g = (g @ vk_inc) @ vk_inc.t()
+            if V_exc is not None and eff_strength > 0.0:
+                vk_exc = V_exc.to(dtype=g.dtype)
+                proj = (g @ vk_exc) @ vk_exc.t()
+                g = g - eff_strength * proj
+            return g
 
         return hook
 
     def register_gradient_hooks(self, network) -> None:
         """Attach projection hooks to lora_down.weight for all matching layers.
 
-        V_K tensors are moved to the LoRA weight device (GPU) here, once, so
-        the hook itself never triggers a CPU→GPU transfer during training.
-
-        If restrict_to_mapped is True, layers with no subspace entry have their
-        gradients zeroed entirely — only mapped layers can learn.
-
-        Args:
-            network: LoRANetwork instance (from trainer/lora.py).
+        V_K tensors are moved to the LoRA weight device (GPU) once here.
+        The hook itself only performs a cheap dtype cast per step.
         """
         self._hooks.clear()
         self._projected_layers = 0
-        self._blocked_layers = 0
         total_layers = len(network.unet_loras + network.te_loras)
 
         for lora in network.unet_loras + network.te_loras:
@@ -212,26 +326,27 @@ class SubspaceGuard:
             if name not in self.subspaces:
                 continue
 
-            # Pre-move V_K to the training device once at registration time.
-            # The hook only needs a dtype cast afterwards, which is a cheap
-            # in-place GPU operation instead of a PCIe transfer per step.
+            entry = self.subspaces[name]
             target_device = lora.lora_down.weight.device
-            V_K = self.subspaces[name]["V_K"].to(device=target_device)
+
+            V_exc = entry["V_exc"].to(device=target_device) if entry["V_exc"] is not None else None
+            V_inc = entry["V_inc"].to(device=target_device) if entry["V_inc"] is not None else None
+            strength_exc = entry.get("strength_exc")
+
             handle = lora.lora_down.weight.register_hook(
-                self._make_projection_hook(V_K)
+                self._make_projection_hook(V_exc, V_inc, strength_exc)
             )
             self._hooks.append(handle)
             self._projected_layers += 1
 
         print(
-            f"SubspaceGuard [{self.label}]: registered projection hooks on "
-            f"{self._projected_layers}/{total_layers} layers"
-            + (f", blocked {self._blocked_layers} unmapped layers." if self.restrict_to_mapped else ".")
+            f"SubspaceGuard [{self.label}]: registered hooks on "
+            f"{self._projected_layers}/{total_layers} layers."
         )
         if self._projected_layers == 0:
             print(
-                f"  Warning: no layers matched.  Check that the subspace file was "
-                f"extracted from LoRAs with the same key naming as this network."
+                "  Warning: no layers matched. Check that the subspace file was "
+                "extracted with the same key naming as this network."
             )
 
     def remove_hooks(self) -> None:
@@ -239,27 +354,22 @@ class SubspaceGuard:
         for handle in self._hooks:
             handle.remove()
         n = self._projected_layers
-        b = self._blocked_layers
         self._hooks.clear()
         self._projected_layers = 0
-        self._blocked_layers = 0
-        detail = f" ({b} blocked)" if b else ""
-        print(f"SubspaceGuard [{self.label}]: removed hooks on {n} projected{detail} layers.")
+        print(f"SubspaceGuard [{self.label}]: removed hooks on {n} layers.")
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
     def projection_stats(self, network) -> dict:
-        """Compute how much gradient energy would be projected away (dry run).
+        """Compute gradient energy fractions (dry run, read-only).
 
-        Accumulates the ratio ||g_protected|| / ||g|| over all matching layers
-        using the *current* weight gradients (call after a backward pass).
-        Returns a dict with mean/max/layer-wise ratios for logging.
-
-        This does not modify any gradients — it is read-only.
+        Returns per-mode ratios for logging after a backward pass.
         """
-        ratios = {}
+        exc_ratios: dict = {}
+        inc_ratios: dict = {}
+
         for lora in network.unet_loras + network.te_loras:
             name = lora.lora_name
             if name not in self.subspaces:
@@ -267,36 +377,47 @@ class SubspaceGuard:
             grad = lora.lora_down.weight.grad
             if grad is None:
                 continue
-            V_K = self.subspaces[name]["V_K"].to(device=grad.device, dtype=grad.dtype)
-            proj = (grad @ V_K) @ V_K.t()
-            ratio = (proj.norm() / (grad.norm() + 1e-8)).item()
-            ratios[name] = ratio
+            entry = self.subspaces[name]
+            gnorm = grad.norm() + 1e-8
 
-        if ratios:
-            vals = list(ratios.values())
-            return {
-                "mean_projection_ratio": sum(vals) / len(vals),
-                "max_projection_ratio": max(vals),
-                "n_layers": len(vals),
-                "per_layer": ratios,
-            }
-        return {}
+            if entry["V_exc"] is not None:
+                vk = entry["V_exc"].to(device=grad.device, dtype=grad.dtype)
+                proj = (grad @ vk) @ vk.t()
+                exc_ratios[name] = (proj.norm() / gnorm).item()
+
+            if entry["V_inc"] is not None:
+                vk = entry["V_inc"].to(device=grad.device, dtype=grad.dtype)
+                proj = (grad @ vk) @ vk.t()
+                inc_ratios[name] = (proj.norm() / gnorm).item()
+
+        result: dict = {}
+        if exc_ratios:
+            vals = list(exc_ratios.values())
+            result["exclude_mean_ratio"] = sum(vals) / len(vals)
+            result["exclude_max_ratio"] = max(vals)
+        if inc_ratios:
+            vals = list(inc_ratios.values())
+            result["include_mean_ratio"] = sum(vals) / len(vals)
+            result["include_max_ratio"] = max(vals)
+        result["n_layers"] = len(set(exc_ratios) | set(inc_ratios))
+        return result
 
 
 # ---------------------------------------------------------------------------
-# Convenience factory used by trainer/train.py
+# Convenience factories used by trainer/train.py
 # ---------------------------------------------------------------------------
 
 
 def prepare_network_filter(t) -> None:
     """Pre-load subspace layer names and store them on t before network creation.
 
-    When subspace_guard_restrict_to_mapped is True, sets t.subspace_guard_allowed_names
-    to the set of layer names present in the subspace file(s).  create_modules in
-    LoRANetwork reads this set and skips any layer not in it, so those layers are
-    never created and consume no parameters, optimizer state, or VRAM.
+    When subspace_guard_restrict_to_mapped is True, sets
+    t.subspace_guard_allowed_names to the union of all layer names across all
+    subspace files listed in subspace_guard_path (regardless of mode).
+    Layers absent from this set are never created — no parameters, no optimizer
+    state, no VRAM.
 
-    Only the safetensors file header is read (key names only, no tensor data).
+    Only the safetensors file headers are read (key names only, no tensors).
     """
     if not bool(getattr(t, "subspace_guard_restrict_to_mapped", False)):
         return
@@ -307,10 +428,10 @@ def prepare_network_filter(t) -> None:
 
     from safetensors import safe_open
 
-    paths = [p.strip() for p in raw_path.split(",") if p.strip()]
+    entries = _parse_guard_entries(raw_path)
     allowed: set[str] = set()
 
-    for path in paths:
+    for path, _mode, _strength in entries:
         if not os.path.isfile(path):
             print(f"SubspaceGuard: WARNING — subspace file not found, skipping: {path}")
             continue
@@ -325,7 +446,7 @@ def prepare_network_filter(t) -> None:
     if allowed:
         t.subspace_guard_allowed_names = allowed
         print(
-            f"SubspaceGuard [restrict_to_mapped]: network creation will be limited "
+            f"SubspaceGuard [restrict_to_mapped]: network creation limited "
             f"to {len(allowed)} mapped layers."
         )
     else:
@@ -336,13 +457,10 @@ def maybe_create_subspace_guard(t, network) -> "SubspaceGuard | None":
     """Create and register a SubspaceGuard if the trainer config requests one.
 
     Reads:
-        t.subspace_guard_path            — comma-separated list of subspace file paths,
-                                           or a single path.  Empty string = disabled.
-        t.subspace_guard_strength        — float in [0, 1], default 1.0.
+        t.subspace_guard_path            — multi-line config (see module docstring),
+                                           or legacy comma-separated paths (all exclude).
+        t.subspace_guard_strength        — global float in [0, 1], default 1.0.
         t.subspace_guard_restrict_to_mapped — bool, default False.
-                                           When True, layers without a subspace entry
-                                           have their gradients zeroed (only mapped
-                                           layers are allowed to learn).
 
     Returns the guard (already registered) or None if disabled.
     """
@@ -353,23 +471,24 @@ def maybe_create_subspace_guard(t, network) -> "SubspaceGuard | None":
     strength = float(getattr(t, "subspace_guard_strength", 1.0) or 1.0)
     restrict = bool(getattr(t, "subspace_guard_restrict_to_mapped", False))
 
-    paths = [p.strip() for p in raw_path.split(",") if p.strip()]
-    missing = [p for p in paths if not os.path.isfile(p)]
+    entries = _parse_guard_entries(raw_path)
+    missing = [(p, m, s) for p, m, s in entries if not os.path.isfile(p)]
     if missing:
         print(
-            f"SubspaceGuard: WARNING — the following subspace files were not found "
-            f"and will be skipped:\n" + "\n".join(f"  {p}" for p in missing)
+            "SubspaceGuard: WARNING — the following files were not found and will be skipped:\n"
+            + "\n".join(f"  [{m}] {p}" for p, m, _ in missing)
         )
-        paths = [p for p in paths if os.path.isfile(p)]
+        entries = [(p, m, s) for p, m, s in entries if os.path.isfile(p)]
 
-    if not paths:
+    if not entries:
         print("SubspaceGuard: no valid subspace files found; guard is disabled.")
         return None
 
-    if len(paths) == 1:
-        guard = SubspaceGuard.from_file(paths[0], strength=strength, restrict_to_mapped=restrict)
-    else:
-        guard = SubspaceGuard.from_files(paths, strength=strength, label="combined", restrict_to_mapped=restrict)
+    paths_for_label = [os.path.splitext(os.path.basename(p))[0] for p, _, _ in entries]
+    label = "+".join(paths_for_label) if len(paths_for_label) <= 3 else f"{len(paths_for_label)}_files"
 
+    guard = SubspaceGuard.from_entries(
+        entries, strength=strength, label=label, restrict_to_mapped=restrict
+    )
     guard.register_gradient_hooks(network)
     return guard

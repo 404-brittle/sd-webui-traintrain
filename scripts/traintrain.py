@@ -97,6 +97,17 @@ network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", 
 LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]
 network_llrd_decay = ["network_llrd_decay", "DD", LLRD_DECAYS, "1.0", float, ALL]
 
+# Subspace guard: gradient projection to prevent learning features from a reference subspace.
+# Set subspace_guard_path to a .safetensors file produced by tools/extract_subspace.py.
+# Multiple files can be comma-separated (e.g. "subspaces/style.safetensors,subspaces/subject.safetensors").
+# subspace_guard_strength controls how aggressively the projection is applied (0.0–1.0, default 1.0).
+GUARD_STRENGTHS = ["1.0", "0.9", "0.75", "0.5", "0.25", "0.0"]
+subspace_guard_path             = ["subspace_guard_path",             "TX", None,           "",    str,   ALL]
+subspace_guard_strength         = ["subspace_guard_strength",         "DD", GUARD_STRENGTHS, "1.0", float, ALL]
+# When enabled, layers that have no subspace mapping are fully blocked (gradient zeroed).
+# Only layers present in the subspace file will be trained.
+subspace_guard_restrict_to_mapped = ["subspace_guard_restrict_to_mapped", "CH", None, False, bool, ALL]
+
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
 r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, train_lr_scheduler_settings, save_lora_name, use_gradient_checkpointing]
@@ -107,7 +118,8 @@ o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps]
-o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter, network_llrd_decay]
+o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter, network_llrd_decay,
+             subspace_guard_path, subspace_guard_strength, subspace_guard_restrict_to_mapped]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 

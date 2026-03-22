@@ -393,6 +393,11 @@ class LoRANetwork(nn.Module):
                         if module_filter.strip() and not _matches_module_filter(lora_name, module_filter):
                             continue
 
+                        # Subspace guard: restrict to mapped layers only
+                        allowed = getattr(t, 'subspace_guard_allowed_names', None)
+                        if allowed is not None and lora_name not in allowed:
+                            continue
+
                         if is_linear or is_conv2d_1x1:
                             dim = self.lora_dim
                             alpha = self.alpha

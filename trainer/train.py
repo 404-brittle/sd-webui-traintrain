@@ -14,6 +14,7 @@ from torch.nn import ModuleList
 from tqdm import tqdm
 from trainer.lora import LoRANetwork, LycorisNetwork
 from trainer import trainer, dataset
+from trainer.subspace_guard import maybe_create_subspace_guard, prepare_network_filter
 from trainer.anima_support import (
     AnimaFlowScheduler,
     AnimaTextModel,
@@ -253,7 +254,9 @@ def train_lora(t):
 
     t.a.print("Train Anima LoRA Start")
 
+    prepare_network_filter(t)
     network, optimizer, lr_scheduler = create_network(t)
+    subspace_guard = maybe_create_subspace_guard(t, network)
 
     if not t.dataloader.data:
         return "No data!"
@@ -331,6 +334,8 @@ def train_lora(t):
             if pbar.n >= t.train_iterations:
                 break
 
+    if subspace_guard is not None:
+        subspace_guard.remove_hooks()
     return savecount(network, t, 0)
 
 
@@ -361,7 +366,9 @@ def train_diff2(t):
         del t.text_model
     flush()
 
+    prepare_network_filter(t)
     network, optimizer, lr_scheduler = create_network(t)
+    subspace_guard = maybe_create_subspace_guard(t, network)
 
     loss_ema = None
     noise = None
@@ -471,10 +478,14 @@ def train_diff2(t):
             result = finisher(network, t, pbar.n)
             if result is not None:
                 del optimizer, lr_scheduler
+                if subspace_guard is not None:
+                    subspace_guard.remove_hooks()
                 return result
 
         epoch += 1
 
+    if subspace_guard is not None:
+        subspace_guard.remove_hooks()
     return savecount(network, t, 0)
 
 

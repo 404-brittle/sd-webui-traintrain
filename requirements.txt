@@ -21,3 +21,9 @@ lycoris_lora
 schedulefree
 pytorch-optimizer
 bitsandbytes>=0.43.0
+
+# tune_lora_scales.py — optional perceptual metrics
+lpips        # --metric lpips               (LPIPS VGG perceptual loss)
+piq          # --metric dists               (DISTS structure+texture similarity)
+scipy        # --preview_schedule beta      (Beta timestep schedule)
+# --metric gram / fft / gram_fft: torchvision (already above) + torch.fft (built-in)

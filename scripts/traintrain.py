@@ -32,7 +32,7 @@ OPTIMIZERS = ["AdamW", "AdamW8bit", "AdaFactor", "Lion", "Prodigy", SEP,
               "CAME", "Tiger", "AdamMini",
               "PagedAdamW", "PagedAdamW32bit", "SGDNesterov", "Adam"]
 LOSS_FUNCTIONS = ["MSE", "L1", "Smooth-L1"]
-SCHEDULERS = ["cosine_annealing", "cosine_annealing_with_restarts", "linear", "cosine",
+SCHEDULERS = ["linear", "cosine_annealing", "cosine_annealing_with_restarts", "linear", "cosine",
               "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup",
               "piecewise_constant", "exponential", "step", "multi_step",
               "reduce_on_plateau", "cyclic", "one_cycle"]

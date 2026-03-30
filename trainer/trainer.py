@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Literal
 from diffusers.optimization import get_scheduler
 from transformers.optimization import AdafactorSchedule
-from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR, CosineAnnealingWarmRestarts, StepLR, MultiStepLR, ReduceLROnPlateau, CyclicLR, OneCycleLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, ExponentialLR, CosineAnnealingWarmRestarts, StepLR, MultiStepLR, ReduceLROnPlateau, CyclicLR, OneCycleLR
 from pprint import pprint
 from accelerate import Accelerator
 from trainer.lora import BLOCKID_ANIMA
@@ -59,7 +59,9 @@ class Trainer():
         self.diff_alt_ratio         = 1.0
 
         self.gradient_accumulation_steps = 1
-        self.train_repeat = 1
+        # train_repeat is configurable — do not override here; setpass already set it.
+        if not hasattr(self, "train_repeat"):
+            self.train_repeat = 1
         self.total_images = 0
         
         self.checkfile()
@@ -446,7 +448,12 @@ def load_lr_scheduler(t, optimizer):
     print(f"LR Scheduler args: {args}")
     
     # アニーリング系のスケジューラを追加
-    if t.train_lr_scheduler == "cosine_annealing":
+    if t.train_lr_scheduler == "linear":
+        return LinearLR(
+            optimizer,
+            **args
+        )
+    elif t.train_lr_scheduler == "cosine_annealing":
         return CosineAnnealingLR(
             optimizer,
             T_max=t.train_iterations,

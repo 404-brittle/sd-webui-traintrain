@@ -78,6 +78,8 @@ image_buckets_step  = ["image_buckets_step", "DD", IMAGESTEPS, "256", int,  LORA
 image_mirroring     = ["image_mirroring",    "CH", None, False, bool, LORA_MDIFF]
 image_use_filename_as_tag = ["image_use_filename_as_tag","CH", None, False, bool, LORA_MDIFF]
 image_disable_upscale = ["image_disable_upscale","CH", None, False, bool, LORA_MDIFF]
+texture_mode        = ["texture_mode",        "CH", None, False, bool, LORA_MDIFF]
+texture_feather_latent_px = ["texture_feather_latent_px", "TX", None, 2, int, LORA_MDIFF]
 save_per_steps      = ["save_per_steps",     "TX", None, 0,    int,   ALL]
 save_precision      = ["save_precision",     "DD", PRECISION_TYPES[:3], "fp16", str, ALL]
 diff_revert_original_target = ["diff_revert_original_target","CH", None, False, bool, DIFF]
@@ -102,7 +104,7 @@ r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate
 r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, train_lr_scheduler_settings, save_lora_name, use_gradient_checkpointing]
 
 o_column1 = [image_buckets_step, image_mirroring, image_use_filename_as_tag, image_disable_upscale,
-             train_fixed_timsteps_in_batch]
+             train_fixed_timsteps_in_batch, texture_mode, texture_feather_latent_px]
 o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,

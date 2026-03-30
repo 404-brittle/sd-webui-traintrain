@@ -1,6 +1,7 @@
 from PIL import Image
 import glob
 import os
+import math
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch
@@ -78,11 +79,52 @@ def _squeeze_cond(cond):
     return cond
 
 
+def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px: int):
+    """Randomly place a crop latent in a zero-padded canvas and return a feathered mask.
+
+    The position is sampled fresh every call so each DataLoader worker draw gives a
+    different placement, providing positional invariance across training steps.
+
+    Returns:
+        canvas  — [1, C, canvas_lat_h, canvas_lat_w]  float tensor
+        mask    — [1, canvas_lat_h, canvas_lat_w]      float tensor in [0, 1]
+    """
+    canvas_h, canvas_w = canvas_hw
+    clat_h, clat_w = canvas_h // 8, canvas_w // 8
+
+    crop = crop_latent.squeeze(0)          # [C, h, w]
+    C, ch, cw = crop.shape
+
+    max_oy = max(0, clat_h - ch)
+    max_ox = max(0, clat_w - cw)
+    oy = random.randint(0, max_oy)
+    ox = random.randint(0, max_ox)
+
+    canvas = torch.zeros(C, clat_h, clat_w, dtype=crop.dtype)
+    canvas[:, oy:oy + ch, ox:ox + cw] = crop
+
+    # Feathered mask: cosine taper over `feather` latent pixels from every edge
+    feather = min(feather_px, ch // 2, cw // 2)
+    patch = torch.ones(ch, cw)
+    for d in range(feather):
+        alpha = 0.5 * (1.0 - math.cos(math.pi * d / feather))
+        patch[d, :]      *= alpha   # top edge row
+        patch[ch-1-d, :] *= alpha   # bottom edge row
+        patch[:, d]      *= alpha   # left edge column
+        patch[:, cw-1-d] *= alpha   # right edge column
+
+    mask = torch.zeros(1, clat_h, clat_w)
+    mask[0, oy:oy + ch, ox:ox + cw] = patch
+
+    return canvas.unsqueeze(0), mask   # [1,C,H,W], [1,H,W]
+
+
 class LatentsConds(Dataset):
     def __init__(self, t, latents_conds):
         self.latents_conds = latents_conds
         self.batch_size = t.train_batch_size
         self.revert = t.diff_revert_original_target
+        self.texture_feather_latent_px = getattr(t, 'texture_feather_latent_px', 2)
         # image_num_multiply hardcoded to 1
         if t.train_batch_size > len(self.latents_conds):
             self.latents_conds = self.latents_conds * t.train_batch_size
@@ -108,7 +150,19 @@ class LatentsConds(Dataset):
             if isinstance(orig_mask, torch.Tensor): batch["mask"] = orig_mask.squeeze().cpu()
 
         else:
-            latent, mask, cond1, cond2 = self.latents_conds[i]
+            item = self.latents_conds[i]
+            if len(item) == 5:
+                latent, _, cond1, cond2, canvas_hw = item
+            else:
+                latent, mask, cond1, cond2 = item
+                canvas_hw = None
+
+            if canvas_hw is not None:
+                # Texture mode: place crop at a fresh random position in the canvas
+                latent, mask = _place_texture_crop(
+                    latent, canvas_hw, self.texture_feather_latent_px
+                )
+
             batch["latent"] = latent.squeeze().cpu()
             if cond1 is not None: batch["cond1"] = cond1 if isinstance(cond1, (str, tuple, list)) else cond1.squeeze().cpu()
             if cond2 is not None: batch["cond2"] = cond2 if isinstance(cond2, (str, tuple, list)) else cond2.squeeze().cpu()
@@ -249,6 +303,22 @@ def load_resize_image_and_text(t):
         if pair_size is not None and image.size != pair_size:
             image = image.resize(pair_size, Image.LANCZOS)
 
+        # --- Texture mode: keep crop at native resolution; defer canvas placement ---
+        if getattr(t, 'texture_mode', False):
+            # Canvas is the guaranteed square bucket (t.image_size[0] × t.image_size[0])
+            canvas_key = (t.image_size[0], t.image_size[0])
+            side = canvas_key[0]
+            # Resize down only if the crop exceeds the canvas
+            if image.width > side or image.height > side:
+                image.thumbnail((side, side), Image.LANCZOS)
+            image = image.convert("RGB")
+            t.image_buckets_raw[canvas_key].append([
+                image, None,
+                load_text_files(txt_path), load_text_files(cap_path),
+                filename, img_path, targ_path, True,  # is_texture flag
+            ])
+            continue
+
         #max sizes
         ratio = image.width / image.height
         ar_errors = t.image_max_ratios - ratio
@@ -343,7 +413,10 @@ def encode_image_text(t):
         bar = tqdm(total = t.total_images)
         for key in t.image_buckets_raw:
             pairdict = {}
-            for image, mask, text, caption, filename, img_path, targ_path in t.image_buckets_raw[key]:
+            for entry in t.image_buckets_raw[key]:
+                is_texture = len(entry) == 8 and entry[7]
+                image, mask, text, caption, filename, img_path, targ_path = entry[:7]
+
                 latent = t.image2latent(t,image)
                 if t.image_use_filename_as_tag:
                     prompt = t.lora_trigger_word + "," + filename
@@ -358,7 +431,14 @@ def encode_image_text(t):
                     emb1, emb2 = (emp1, emp2) if prompt is None else t.text_model.encode_text(prompt)
                 else:
                     emb1 = emb2 = prompt
-                t.image_buckets[key].append([latent, mask, emb1, emb2])
+
+                if is_texture:
+                    # Store the crop latent + canvas dimensions; LatentsConds places it
+                    # randomly at training time to give positional invariance.
+                    canvas_hw = (key[1], key[0])  # (height, width) in pixels; key is (W, H)
+                    t.image_buckets[key].append([latent, None, emb1, emb2, canvas_hw])
+                else:
+                    t.image_buckets[key].append([latent, mask, emb1, emb2])
                 bar.update(1)
                 pairdict[img_path] = [latent, mask, emb1, emb2, targ_path, image]
             

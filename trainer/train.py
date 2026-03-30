@@ -298,8 +298,12 @@ def train_lora(t):
 
                 # Flow matching loss target: velocity = noise - latents
                 velocity_target = (noise - latents).to(torch.float32)
+                train_mask = batch.get("mask")
+                if train_mask is not None:
+                    train_mask = train_mask.to(CUDA)
                 loss, loss_ema, loss_velocity = process_loss(
-                    t, model_pred, velocity_target, timesteps, loss_ema, loss_velocity
+                    t, model_pred, velocity_target, timesteps, loss_ema, loss_velocity,
+                    mask=train_mask,
                 )
 
                 c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
@@ -583,7 +587,7 @@ def makesavelist(t):
         t.save_list = []
 
 
-def process_loss(t, original, target, timesteps, loss_ema, loss_velocity, copy=False):
+def process_loss(t, original, target, timesteps, loss_ema, loss_velocity, mask=None, copy=False):
     if t.train_loss_function == "MSE":
         loss = torch.nn.functional.mse_loss(original.float(), target.float(), reduction="none")
     elif t.train_loss_function == "L1":
@@ -593,7 +597,17 @@ def process_loss(t, original, target, timesteps, loss_ema, loss_velocity, copy=F
     else:
         loss = torch.nn.functional.mse_loss(original.float(), target.float(), reduction="none")
 
-    loss = loss.mean([1, 2, 3])
+    if mask is not None:
+        # Weighted mean over the masked region; empty canvas → zero gradient.
+        # mask: [B, H, W] → [B, 1, H, W] → expand to [B, C, H, W] so the
+        # denominator counts every active (channel, spatial) element.
+        m = mask.to(loss.device)
+        if m.dim() == 3:
+            m = m.unsqueeze(1)
+        m = m.expand_as(loss)
+        loss = (loss * m).sum(dim=[1, 2, 3]) / m.sum(dim=[1, 2, 3]).clamp(min=1e-8)
+    else:
+        loss = loss.mean([1, 2, 3])
     loss = loss.mean()
 
     if loss_ema is None:

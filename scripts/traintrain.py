@@ -32,7 +32,7 @@ OPTIMIZERS = ["AdamW", "AdamW8bit", "AdaFactor", "Lion", "Prodigy", SEP,
               "CAME", "Tiger", "AdamMini",
               "PagedAdamW", "PagedAdamW32bit", "SGDNesterov", "Adam"]
 LOSS_FUNCTIONS = ["MSE", "L1", "Smooth-L1"]
-SCHEDULERS = ["cosine_annealing", "cosine_annealing_with_restarts", "linear", "cosine",
+SCHEDULERS = ["linear", "cosine_annealing", "cosine_annealing_with_restarts", "cosine",
               "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup",
               "piecewise_constant", "exponential", "step", "multi_step",
               "reduce_on_plateau", "cyclic", "one_cycle"]
@@ -91,7 +91,7 @@ train_max_timesteps = ["train_max_timesteps","TX", None, 1000, int,   ALL]
 # Examples:  "!adaln_modulation"   →  skip adaln (recommended for Anima)
 #            "attn, mlp"           →  attention + MLP only
 #            "attn"                →  attention projections only
-network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", None, "", str, ALL]
+network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", None, "!adaln_modulation", str, ALL]
 # Layer-wise LR decay: last block trains at base_lr, each earlier block is scaled by decay^depth.
 # 1.0 = disabled (flat LR). 0.9 is a good starting point; lower values are more aggressive.
 LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]

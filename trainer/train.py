@@ -278,11 +278,9 @@ def train_lora(t):
 
                 ts_lo = max(0, t.train_min_timesteps)
                 ts_hi = max(ts_lo + 1, min(1000, t.train_max_timesteps))
-                timesteps = torch.randint(
-                    ts_lo, ts_hi,
-                    ((1 if t.train_fixed_timsteps_in_batch else batch_size),),
-                    device=CUDA
-                )
+                flow_shift = getattr(t, 'train_flow_shift', 3.0)
+                n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
+                timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, flow_shift, CUDA)
                 timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
 
                 noisy_latents = t.noise_scheduler.add_noise(latents, noise, timesteps)
@@ -409,12 +407,11 @@ def train_diff2(t):
                 time_max = time_min + band_span
                 time_max = max(time_min + 1, min(time_max, ts_range_hi))
 
-            timesteps = torch.randint(
-                int(min(time_min, ts_range_hi - 1)),
-                int(max(time_max, ts_range_lo + 1)),
-                ((1 if t.train_fixed_timsteps_in_batch else batch_size),),
-                device=CUDA,
-            )
+            flow_shift = getattr(t, 'train_flow_shift', 3.0)
+            n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
+            band_lo = int(min(time_min, ts_range_hi - 1))
+            band_hi = int(max(time_max, ts_range_lo + 1))
+            timesteps = _sample_timesteps(band_lo, band_hi, n_ts, flow_shift, CUDA)
             timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
 
             orig_noisy_latents = t.noise_scheduler.add_noise(
@@ -485,6 +482,22 @@ def train_diff2(t):
 def flush():
     torch.cuda.empty_cache()
     gc.collect()
+
+
+def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, flow_shift: float, device) -> torch.Tensor:
+    """Sample n integer timesteps in [ts_lo, ts_hi) using logit-normal flow shift.
+
+    This matches the reference diffusion-pipe formulation by producing a logit-normal
+    curve that shifts center-focus depending on the discrete flow shift parameters.
+    """
+    if flow_shift == 1.0:
+        u = torch.sigmoid(torch.randn(n, device=device))
+        return (u * (ts_hi - ts_lo) + ts_lo).long().clamp(ts_lo, ts_hi - 1)
+    
+    u = torch.sigmoid(torch.randn(n, device=device))
+    sigma = (u * flow_shift) / (1.0 + (flow_shift - 1.0) * u)
+    ts = (sigma * (ts_hi - ts_lo) + ts_lo).long().clamp(ts_lo, ts_hi - 1)
+    return ts
 
 
 def create_network(t):
@@ -607,10 +620,10 @@ def image2latent(t, image):
 
     image_np = numpy.array(image).astype(numpy.float32) / 255.0
     image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+    image_tensor = image_tensor * 2.0 - 1.0  # [0, 1] -> [-1, 1] (Anima VAE expects [-1, 1])
     image_tensor = image_tensor.to(CUDA, dtype=t.train_model_precision)
 
     with torch.no_grad():
-        # Anima VAE expects [0, 1] range and handles normalization internally
         latent = t.vae.encode_pixels_to_latents(image_tensor)  # [1, C, H, W]
 
     return latent

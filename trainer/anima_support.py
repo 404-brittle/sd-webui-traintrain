@@ -115,6 +115,8 @@ def anima_forward(t, noisy_latents: torch.Tensor, timesteps: torch.Tensor, conds
             target_attention_mask=t5_attn_mask,
             source_attention_mask=attn_mask,
         )
+        if t5_attn_mask is not None:
+            cross[~t5_attn_mask.bool()] = 0.0
     else:
         cross = prompt_embeds
 

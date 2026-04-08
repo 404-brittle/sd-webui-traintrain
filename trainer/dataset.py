@@ -79,11 +79,24 @@ def _squeeze_cond(cond):
     return cond
 
 
-def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px: int):
-    """Randomly place a crop latent in a zero-padded canvas and return a feathered mask.
+def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px: int,
+                        alpha_crop: torch.Tensor | None = None,
+                        tile_px: int | None = None):
+    """Randomly sample a square tile from the (pre-scaled) image latent, then place it
+    at a random position in a zero-padded canvas and return a feathered mask.
 
-    The position is sampled fresh every call so each DataLoader worker draw gives a
-    different placement, providing positional invariance across training steps.
+    Both the source position and (when tile_px is None) tile size are re-sampled every
+    call, so each DataLoader worker draw gives positional/scale variance.
+
+    Args:
+        crop_latent: encoded latent of the (already tile-scaled) image, any size.
+        canvas_hw:   (H, W) in pixels of the training canvas.
+        feather_px:  cosine feather width in latent pixels.
+        alpha_crop:  optional [img_lat_h, img_lat_w] float tensor (0-1) aligned with
+                     the full image latent. Multiplied into the feathered patch.
+        tile_px:     if given, the fixed square tile side in *pixels* (divided by 8
+                     for latent space). The tile is clamped to the image latent size
+                     when the image is smaller. When None, tile size is random.
 
     Returns:
         canvas  — [1, C, canvas_lat_h, canvas_lat_w]  float tensor
@@ -92,29 +105,56 @@ def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px:
     canvas_h, canvas_w = canvas_hw
     clat_h, clat_w = canvas_h // 8, canvas_w // 8
 
-    crop = crop_latent.squeeze(0)          # [C, h, w]
-    C, ch, cw = crop.shape
+    crop = crop_latent.squeeze(0)          # [C, img_h, img_w]
+    C, ih, iw = crop.shape
 
-    max_oy = max(0, clat_h - ch)
-    max_ox = max(0, clat_w - cw)
+    # --- Determine square tile size in latent space ---
+    if tile_px is not None:
+        # Fixed tile: convert pixels → latent units, clamp to what fits in both
+        # the (scaled) image latent and the canvas latent.
+        tile_lat = max(1, tile_px // 8)
+        th = tw = min(tile_lat, ih, iw, clat_h, clat_w)
+    else:
+        # Random tile: uniform in [max/4, max] where max fits both image and canvas.
+        max_tile = min(ih, iw, clat_h, clat_w)
+        min_tile = max(1, max_tile // 4)
+        th = tw = random.randint(min_tile, max_tile)
+
+    # Random source position within the image latent
+    src_y = random.randint(0, ih - th)
+    src_x = random.randint(0, iw - tw)
+    tile = crop[:, src_y:src_y + th, src_x:src_x + tw]   # [C, th, tw]
+
+    # --- Random destination position within the canvas ---
+    max_oy = clat_h - th
+    max_ox = clat_w - tw
     oy = random.randint(0, max_oy)
     ox = random.randint(0, max_ox)
 
     canvas = torch.zeros(C, clat_h, clat_w, dtype=crop.dtype)
-    canvas[:, oy:oy + ch, ox:ox + cw] = crop
+    canvas[:, oy:oy + th, ox:ox + tw] = tile
 
     # Feathered mask: cosine taper over `feather` latent pixels from every edge
-    feather = min(feather_px, ch // 2, cw // 2)
-    patch = torch.ones(ch, cw)
+    feather = min(feather_px, th // 2, tw // 2)
+    patch = torch.ones(th, tw)
     for d in range(feather):
-        alpha = 0.5 * (1.0 - math.cos(math.pi * d / feather))
-        patch[d, :]      *= alpha   # top edge row
-        patch[ch-1-d, :] *= alpha   # bottom edge row
-        patch[:, d]      *= alpha   # left edge column
-        patch[:, cw-1-d] *= alpha   # right edge column
+        v = 0.5 * (1.0 - math.cos(math.pi * d / feather))
+        patch[d, :]      *= v   # top edge
+        patch[th-1-d, :] *= v   # bottom edge
+        patch[:, d]      *= v   # left edge
+        patch[:, tw-1-d] *= v   # right edge
+
+    # Blend in alpha mask (from image alpha channel or external mask file).
+    # alpha_crop is aligned with the full image latent, so crop the same region.
+    if alpha_crop is not None:
+        ac = alpha_crop
+        if ac.shape != (ih, iw):
+            ac = F.interpolate(ac.unsqueeze(0).unsqueeze(0).float(),
+                               size=(ih, iw), mode='bilinear', align_corners=False)[0, 0]
+        patch = patch * ac[src_y:src_y + th, src_x:src_x + tw]
 
     mask = torch.zeros(1, clat_h, clat_w)
-    mask[0, oy:oy + ch, ox:ox + cw] = patch
+    mask[0, oy:oy + th, ox:ox + tw] = patch
 
     return canvas.unsqueeze(0), mask   # [1,C,H,W], [1,H,W]
 
@@ -151,16 +191,23 @@ class LatentsConds(Dataset):
 
         else:
             item = self.latents_conds[i]
-            if len(item) == 5:
-                latent, _, cond1, cond2, canvas_hw = item
+            if len(item) == 6:
+                latent, alpha_crop_mask, cond1, cond2, canvas_hw, tile_res = item
+            elif len(item) == 5:
+                latent, alpha_crop_mask, cond1, cond2, canvas_hw = item
+                tile_res = 0
             else:
                 latent, mask, cond1, cond2 = item
                 canvas_hw = None
+                alpha_crop_mask = None
+                tile_res = 0
 
             if canvas_hw is not None:
-                # Texture mode: place crop at a fresh random position in the canvas
+                # Texture mode: sample tile then place at a fresh random position in the canvas
                 latent, mask = _place_texture_crop(
-                    latent, canvas_hw, self.texture_feather_latent_px
+                    latent, canvas_hw, self.texture_feather_latent_px,
+                    alpha_crop=alpha_crop_mask,
+                    tile_px=tile_res if tile_res > 0 else None,
                 )
 
             batch["latent"] = latent.squeeze().cpu()
@@ -303,17 +350,47 @@ def load_resize_image_and_text(t):
         if pair_size is not None and image.size != pair_size:
             image = image.resize(pair_size, Image.LANCZOS)
 
-        # --- Texture mode: keep crop at native resolution; defer canvas placement ---
+        # --- Texture mode: scale then keep; defer canvas placement ---
         if getattr(t, 'texture_mode', False):
             # Canvas is the guaranteed square bucket (t.image_size[0] × t.image_size[0])
             canvas_key = (t.image_size[0], t.image_size[0])
-            side = canvas_key[0]
-            # Resize down only if the crop exceeds the canvas
-            if image.width > side or image.height > side:
-                image.thumbnail((side, side), Image.LANCZOS)
+
+            # Apply tile scale: <1.0 downscales (sharper tiles), >1.0 upscales (chunkier).
+            # Do this before alpha/mask extraction so the mask stays aligned.
+            tile_scale = getattr(t, 'texture_tile_scale', 1.0)
+            if tile_scale != 1.0:
+                new_w = round(image.width * tile_scale) or 8
+                new_w = new_w if new_w >= 8 else 8
+                new_h = round(image.height * tile_scale) or 8
+                new_h = new_h if new_h >= 8 else 8
+                image = image.resize((new_w, new_h), Image.LANCZOS)
+
+            # --- Alpha / mask extraction ---
+            alpha_mask = None
+            mask_img = None
+            if image.mode == "RGBA":
+                mask_img = image.split()[3]  # alpha channel as grayscale L image
+            else:
+                mask_dir = getattr(t, 'texture_mask_directory', None)
+                if mask_dir:
+                    stem = os.path.splitext(os.path.basename(img_path))[0]
+                    for _ext in ('.png', '.jpg', '.jpeg', '.webp', '.bmp'):
+                        _mp = os.path.join(mask_dir, stem + _ext)
+                        if os.path.isfile(_mp):
+                            mask_img = Image.open(_mp).convert("L").resize(
+                                (image.width, image.height), Image.LANCZOS)
+                            break
+            if mask_img is not None:
+                lat_h, lat_w = image.height // 8, image.width // 8
+                alpha_mask = torch.from_numpy(np.array(mask_img)).float() / 255.0
+                alpha_mask = F.interpolate(
+                    alpha_mask.unsqueeze(0).unsqueeze(0),
+                    size=(lat_h, lat_w), mode='bilinear', align_corners=False
+                )[0, 0]
+
             image = image.convert("RGB")
             t.image_buckets_raw[canvas_key].append([
-                image, None,
+                image, alpha_mask,
                 load_text_files(txt_path), load_text_files(cap_path),
                 filename, img_path, targ_path, True,  # is_texture flag
             ])
@@ -345,6 +422,7 @@ def load_resize_image_and_text(t):
                 image = image.crop((0, upper, bucket_width, lower))
 
             if usealpha:
+                print("usealpha!")
                 tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
                 # アルファチャンネルの抽出
                 alpha_channel = tensor[3]
@@ -435,8 +513,10 @@ def encode_image_text(t):
                 if is_texture:
                     # Store the crop latent + canvas dimensions; LatentsConds places it
                     # randomly at training time to give positional invariance.
+                    # mask here is the alpha crop mask (or None) derived at load time.
                     canvas_hw = (key[1], key[0])  # (height, width) in pixels; key is (W, H)
-                    t.image_buckets[key].append([latent, None, emb1, emb2, canvas_hw])
+                    tile_res = getattr(t, 'texture_tile_resolution', 0)
+                    t.image_buckets[key].append([latent, mask, emb1, emb2, canvas_hw, tile_res])
                 else:
                     t.image_buckets[key].append([latent, mask, emb1, emb2])
                 bar.update(1)

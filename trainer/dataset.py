@@ -166,6 +166,7 @@ class LatentsConds(Dataset):
         self.batch_size = t.train_batch_size
         self.revert = t.diff_revert_original_target
         self.texture_feather_latent_px = getattr(t, 'texture_feather_latent_px', 2)
+        self.texture_energy_threshold = getattr(t, 'texture_energy_threshold', 0)
         # image_num_multiply hardcoded to 1
         if t.train_batch_size > len(self.latents_conds):
             self.latents_conds = self.latents_conds * t.train_batch_size
@@ -201,33 +202,67 @@ class LatentsConds(Dataset):
                 canvas_h, canvas_w = canvas_hw
                 clat_h, clat_w = canvas_h // 8, canvas_w // 8
                 
-                # Resolve tile size in pixels
-                if tile_res > 0:
-                    tile_px = tile_res
-                else:
-                    # Random range mirroring _place_texture_crop logic but in pixels
-                    max_tile_lat = min(image.width // 8, image.height // 8, clat_h, clat_w)
-                    if tile_scale > 1.0:
-                        max_tile_lat = min(max_tile_lat, round(image.width * tile_scale) // 8, round(image.height * tile_scale) // 8)
+                best_crop = None
+                best_energy = -1
+                
+                # Attempt up to 10 random crops to find one with enough "energy" (detail/edges)
+                max_attempts = 10 if self.texture_energy_threshold > 0 else 1
+                for attempt in range(max_attempts):
+                    # Resolve tile size in pixels
+                    if tile_res > 0:
+                        tile_px = tile_res
+                    else:
+                        max_tile_lat = min(image.width // 8, image.height // 8, clat_h, clat_w)
+                        if tile_scale > 1.0:
+                            max_tile_lat = min(max_tile_lat, round(image.width * tile_scale) // 8, round(image.height * tile_scale) // 8)
+                        min_tile_lat = max(1, max_tile_lat // 4)
+                        tile_lat = random.randint(min_tile_lat, max_tile_lat)
+                        tile_px = tile_lat * 8
                     
-                    min_tile_lat = max(1, max_tile_lat // 4)
-                    tile_lat = random.randint(min_tile_lat, max_tile_lat)
-                    tile_px = tile_lat * 8
+                    src_px = max(8, round(tile_px / tile_scale))
+                    src_px = min(src_px, image.width, image.height)
+                    tile_px = round(src_px * tile_scale)
+                    
+                    src_y = random.randint(0, image.height - src_px)
+                    src_x = random.randint(0, image.width - src_px)
+                    
+                    candidate_crop = image.crop((src_x, src_y, src_x + src_px, src_y + src_px))
+                    
+                    # If threshold is enabled, check energy (Laplacian variance)
+                    if self.texture_energy_threshold > 0:
+                        # Convert to grayscale numpy for lightweight calculation
+                        gray = np.array(candidate_crop.convert("L"), dtype=np.float32) / 255.0
+                        # Simple 3x3 Laplacian kernel
+                        laplace = (
+                            gray[1:-1, 1:-1] * 4 -
+                            gray[:-2, 1:-1] - gray[2:, 1:-1] -
+                            gray[1:-1, :-2] - gray[1:-1, 2:]
+                        )
+                        
+                        # Factor in mask if present (masked-off areas have 0 energy)
+                        if mask is not None:
+                            # Crop and resize mask to align with the [1:-1, 1:-1] laplacian dimensions
+                            m_crop = mask.crop((src_x, src_y, src_x + src_px, src_y + src_px))
+                            m_crop = m_crop.convert("L").resize((src_px - 2, src_px - 2), Image.BILINEAR)
+
+                            m_np = np.array(m_crop).astype(np.float32) / 255.0
+                            laplace = laplace * m_np
+
+                        energy = np.var(laplace)
+                        
+                        if energy > best_energy:
+                            best_energy = energy
+                            best_crop = (candidate_crop, src_x, src_y, src_px, tile_px)
+                        
+                        if energy >= self.texture_energy_threshold:
+                            break
+                    else:
+                        best_crop = (candidate_crop, src_x, src_y, src_px, tile_px)
+                        break
+
                 
-                # Source crop size in pixels
-                src_px = max(8, round(tile_px / tile_scale))
-                
-                # Ensure src_px fits in original image
-                src_px = min(src_px, image.width, image.height)
-                # Re-sync tile_px if we had to clamp src_px
-                tile_px = round(src_px * tile_scale)
-                
-                # Random location
-                src_y = random.randint(0, image.height - src_px)
-                src_x = random.randint(0, image.width - src_px)
-                
-                # Crop and scale PIL
-                crop_pil = image.crop((src_x, src_y, src_x + src_px, src_y + src_px)).resize((tile_px, tile_px), Image.LANCZOS)
+                crop_pil, src_x, src_y, src_px, tile_px = best_crop
+                crop_pil = crop_pil.resize((tile_px, tile_px), Image.LANCZOS)
                 
                 # Encode tile
                 latent = self.t.image2latent(self.t, crop_pil) # [1, C, th, tw]

@@ -85,6 +85,8 @@ texture_mask_directory = ["texture_mask_directory", "TX", None, "", str, LORA_MD
 texture_tile_scale  = ["texture_tile_scale",  "TX", None, 1.0, float, LORA_MDIFF]
 # tile_resolution: pixel side of the square tile sampled from the scaled image (0=random range)
 texture_tile_resolution = ["texture_tile_resolution", "TX", None, 0, int, LORA_MDIFF]
+# energy_threshold: skip flat/empty tiles; reroll until detail > this (0.01 is a good start, 0 = disabled)
+texture_energy_threshold = ["texture_energy_threshold", "TX", None, 0, float, LORA_MDIFF]
 save_per_steps      = ["save_per_steps",     "TX", None, 0,    int,   ALL]
 save_precision      = ["save_precision",     "DD", PRECISION_TYPES[:3], "fp16", str, ALL]
 diff_revert_original_target = ["diff_revert_original_target","CH", None, False, bool, DIFF]
@@ -110,7 +112,7 @@ r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, trai
 
 o_column1 = [image_buckets_step, image_mirroring, image_use_filename_as_tag, image_disable_upscale,
              train_fixed_timsteps_in_batch, texture_mode, texture_feather_latent_px, texture_mask_directory,
-             texture_tile_scale, texture_tile_resolution]
+             texture_tile_scale, texture_tile_resolution, texture_energy_threshold]
 o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,

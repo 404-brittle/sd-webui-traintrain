@@ -261,9 +261,11 @@ def train_lora(t):
     loss_ema = None
     loss_velocity = None
 
-    del t.vae
-    if "BASE" not in t.network_blocks:
-        del t.text_model
+    if not getattr(t, 'texture_mode', False):
+        del t.vae
+        if "BASE" not in t.network_blocks:
+            del t.text_model
+
     flush()
 
     pbar = tqdm(range(t.train_iterations))
@@ -358,9 +360,11 @@ def train_diff2(t):
     if not t.dataloader.data:
         return "No data!"
 
-    del t.vae
-    if "BASE" not in t.network_blocks:
-        del t.text_model
+    if not getattr(t, 'texture_mode', False):
+        del t.vae
+        if "BASE" not in t.network_blocks:
+            del t.text_model
+
     flush()
 
     network, optimizer, lr_scheduler = create_network(t)

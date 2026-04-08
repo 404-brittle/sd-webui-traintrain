@@ -161,6 +161,7 @@ def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px:
 
 class LatentsConds(Dataset):
     def __init__(self, t, latents_conds):
+        self.t = t
         self.latents_conds = latents_conds
         self.batch_size = t.train_batch_size
         self.revert = t.diff_revert_original_target
@@ -191,24 +192,80 @@ class LatentsConds(Dataset):
 
         else:
             item = self.latents_conds[i]
-            if len(item) == 6:
-                latent, alpha_crop_mask, cond1, cond2, canvas_hw, tile_res = item
-            elif len(item) == 5:
-                latent, alpha_crop_mask, cond1, cond2, canvas_hw = item
-                tile_res = 0
-            else:
-                latent, mask, cond1, cond2 = item
-                canvas_hw = None
+            
+            # Detect JIT texture source
+            if isinstance(item, list) and item[0] == "texture_source":
+                _, image, mask, emb1, emb2, canvas_hw, tile_res, tile_scale = item
+                
+                # JIT: Randomly crop, scale, and encode
+                canvas_h, canvas_w = canvas_hw
+                clat_h, clat_w = canvas_h // 8, canvas_w // 8
+                
+                # Resolve tile size in pixels
+                if tile_res > 0:
+                    tile_px = tile_res
+                else:
+                    # Random range mirroring _place_texture_crop logic but in pixels
+                    max_tile_lat = min(image.width // 8, image.height // 8, clat_h, clat_w)
+                    if tile_scale > 1.0:
+                        max_tile_lat = min(max_tile_lat, round(image.width * tile_scale) // 8, round(image.height * tile_scale) // 8)
+                    
+                    min_tile_lat = max(1, max_tile_lat // 4)
+                    tile_lat = random.randint(min_tile_lat, max_tile_lat)
+                    tile_px = tile_lat * 8
+                
+                # Source crop size in pixels
+                src_px = max(8, round(tile_px / tile_scale))
+                
+                # Ensure src_px fits in original image
+                src_px = min(src_px, image.width, image.height)
+                # Re-sync tile_px if we had to clamp src_px
+                tile_px = round(src_px * tile_scale)
+                
+                # Random location
+                src_y = random.randint(0, image.height - src_px)
+                src_x = random.randint(0, image.width - src_px)
+                
+                # Crop and scale PIL
+                crop_pil = image.crop((src_x, src_y, src_x + src_px, src_y + src_px)).resize((tile_px, tile_px), Image.LANCZOS)
+                
+                # Encode tile
+                latent = self.t.image2latent(self.t, crop_pil) # [1, C, th, tw]
+                
+                # Handle alpha mask if present
                 alpha_crop_mask = None
-                tile_res = 0
-
-            if canvas_hw is not None:
-                # Texture mode: sample tile then place at a fresh random position in the canvas
+                if mask is not None:
+                    mask_crop = mask.crop((src_x, src_y, src_x + src_px, src_y + src_px)).resize((tile_px, tile_px), Image.BILINEAR)
+                    mask_np = np.array(mask_crop).astype(np.float32) / 255.0
+                    alpha_crop_mask = torch.from_numpy(mask_np) # [th, tw]
+                
+                # Place and feather
                 latent, mask = _place_texture_crop(
                     latent, canvas_hw, self.texture_feather_latent_px,
                     alpha_crop=alpha_crop_mask,
-                    tile_px=tile_res if tile_res > 0 else None,
+                    tile_px=tile_px
                 )
+                
+                cond1, cond2 = emb1, emb2
+            else:
+                if len(item) == 6:
+                    latent, alpha_crop_mask, cond1, cond2, canvas_hw, tile_res = item
+                elif len(item) == 5:
+                    latent, alpha_crop_mask, cond1, cond2, canvas_hw = item
+                    tile_res = 0
+                else:
+                    latent, mask, cond1, cond2 = item
+                    canvas_hw = None
+                    alpha_crop_mask = None
+                    tile_res = 0
+
+                if canvas_hw is not None:
+                    # Texture mode (legacy/pre-encoded): sample tile then place
+                    latent, mask = _place_texture_crop(
+                        latent, canvas_hw, self.texture_feather_latent_px,
+                        alpha_crop=alpha_crop_mask,
+                        tile_px=tile_res if tile_res > 0 else None,
+                    )
 
             batch["latent"] = latent.squeeze().cpu()
             if cond1 is not None: batch["cond1"] = cond1 if isinstance(cond1, (str, tuple, list)) else cond1.squeeze().cpu()
@@ -336,9 +393,6 @@ def find_filesets(t):
                 pairpathsets.append(pathdict[diff_target_path] + [new_size, None])
         t.image_pathsets = pairpathsets
 
-import os
-from PIL import Image
-
 
 def load_resize_image_and_text(t):
     for img_path, txt_path, cap_path, filename, pair_size, targ_path in t.image_pathsets:
@@ -350,26 +404,14 @@ def load_resize_image_and_text(t):
         if pair_size is not None and image.size != pair_size:
             image = image.resize(pair_size, Image.LANCZOS)
 
-        # --- Texture mode: scale then keep; defer canvas placement ---
+        # --- Texture mode ---
         if getattr(t, 'texture_mode', False):
-            # Canvas is the guaranteed square bucket (t.image_size[0] × t.image_size[0])
             canvas_key = (t.image_size[0], t.image_size[0])
 
-            # Apply tile scale: <1.0 downscales (sharper tiles), >1.0 upscales (chunkier).
-            # Do this before alpha/mask extraction so the mask stays aligned.
-            tile_scale = getattr(t, 'texture_tile_scale', 1.0)
-            if tile_scale != 1.0:
-                new_w = round(image.width * tile_scale) or 8
-                new_w = new_w if new_w >= 8 else 8
-                new_h = round(image.height * tile_scale) or 8
-                new_h = new_h if new_h >= 8 else 8
-                image = image.resize((new_w, new_h), Image.LANCZOS)
-
-            # --- Alpha / mask extraction ---
-            alpha_mask = None
+            # JIT UPDATE: Store raw PIL objects
             mask_img = None
             if image.mode == "RGBA":
-                mask_img = image.split()[3]  # alpha channel as grayscale L image
+                mask_img = image.split()[3]
             else:
                 mask_dir = getattr(t, 'texture_mask_directory', None)
                 if mask_dir:
@@ -380,27 +422,20 @@ def load_resize_image_and_text(t):
                             mask_img = Image.open(_mp).convert("L").resize(
                                 (image.width, image.height), Image.LANCZOS)
                             break
-            if mask_img is not None:
-                lat_h, lat_w = image.height // 8, image.width // 8
-                alpha_mask = torch.from_numpy(np.array(mask_img)).float() / 255.0
-                alpha_mask = F.interpolate(
-                    alpha_mask.unsqueeze(0).unsqueeze(0),
-                    size=(lat_h, lat_w), mode='bilinear', align_corners=False
-                )[0, 0]
-
+            
             image = image.convert("RGB")
             t.image_buckets_raw[canvas_key].append([
-                image, alpha_mask,
+                image, mask_img,
                 load_text_files(txt_path), load_text_files(cap_path),
-                filename, img_path, targ_path, True,  # is_texture flag
+                filename, img_path, targ_path, True,
             ])
             continue
 
-        #max sizes
+        # buckets logic for non-texture mode...
         ratio = image.width / image.height
         ar_errors = t.image_max_ratios - ratio
-        indice = np.argmin(np.abs(ar_errors))  # 一番近いアスペクト比のインデックス
-        max = t.image_max_buckets_sizes[indice]
+        indice = np.argmin(np.abs(ar_errors))
+        max_size = t.image_max_buckets_sizes[indice]
         ar_error = ar_errors[indice]
 
         def resize_and_crop(ar_error, image, bucket_width, bucket_height, disable_upscale):
@@ -408,13 +443,13 @@ def load_resize_image_and_text(t):
                 ar_error <= 0 and image.height < bucket_height) and disable_upscale:
                 return None
 
-            if ar_error <= 0:  # 幅＜高さなら高さを合わせる
+            if ar_error <= 0:
                 temp_width = int(image.width*bucket_height/image.height)
-                image = image.resize((temp_width, bucket_height))  # アスペクト比を変えずに高さだけbucketに合わせる
-                left = (temp_width - bucket_width) / 2  # 切り取り境界左側
-                right = bucket_width + left  # 切り取り境界右側
-                image = image.crop((left, 0, right, bucket_height))  # 左右切り取り
-            else:  # 幅高さを逆にしたもの
+                image = image.resize((temp_width, bucket_height))
+                left = (temp_width - bucket_width) / 2
+                right = bucket_width + left
+                image = image.crop((left, 0, right, bucket_height))
+            else:
                 temp_height = int(image.height*bucket_width/image.width)
                 image = image.resize((bucket_width, temp_height))
                 upper = (temp_height - bucket_height) / 2
@@ -422,56 +457,45 @@ def load_resize_image_and_text(t):
                 image = image.crop((0, upper, bucket_width, lower))
 
             if usealpha:
-                print("usealpha!")
                 tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
-                # アルファチャンネルの抽出
                 alpha_channel = tensor[3]
-                # 透明な部分を0、透明でない部分を1に設定
                 alpha_mask = (alpha_channel > 0.1).float()
-                # マスクのサイズを取得
                 H, W = alpha_mask.shape
-                # 新しいサイズを計算（縦横8分の1）
                 new_H, new_W = H // 8, W // 8
-                # マスクを縦横8分の1にリサイズ
                 mask = F.interpolate(alpha_mask.unsqueeze(0).unsqueeze(0), size=(new_H, new_W), mode='nearest')[0, 0]
             else:
-                # アルファチャンネルがない場合の画像サイズの取得
                 tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
-                _, H, W = tensor.shape  # アルファチャンネルがない場合のためにRGBチャンネルを無視
-                new_H, new_W = H // 8, W // 8  # 新しいサイズを計算（縦横8分の1）
-                # すべて1のテンソルを作成
+                _, H, W = tensor.shape
+                new_H, new_W = H // 8, W // 8
                 mask = torch.ones((new_H, new_W))
 
             image = image.convert("RGB")
-
             return image, mask
 
-        resized, alpha_mask = resize_and_crop(ar_error, image, *max, t.image_disable_upscale)
+        resized, alpha_mask = resize_and_crop(ar_error, image, *max_size, t.image_disable_upscale)
         if resized is not None:
-            t.image_buckets_raw[max].append([resized, alpha_mask, load_text_files(txt_path), load_text_files(cap_path), filename, img_path, targ_path])
+            t.image_buckets_raw[max_size].append([resized, alpha_mask, load_text_files(txt_path), load_text_files(cap_path), filename, img_path, targ_path])
             if t.image_mirroring:
                 flipped = resized.transpose(Image.FLIP_LEFT_RIGHT)
                 flipped_mask = torch.flip(alpha_mask, [1]) if alpha_mask is not None else None
-                t.image_buckets_raw[max].append([flipped, flipped_mask, load_text_files(txt_path), load_text_files(cap_path), filename, img_path+"m", targ_path+"m" if targ_path is not None else targ_path])
+                t.image_buckets_raw[max_size].append([flipped, flipped_mask, load_text_files(txt_path), load_text_files(cap_path), filename, img_path+"m", targ_path+"m" if targ_path is not None else targ_path])
 
         ar_errors = t.image_sub_ratios - ratio
-
         try:
             for _ in range(t.sub_image_num):
-                indice = np.argmin(np.abs(ar_errors))  # 一番近いアスペクト比のインデックス
-                sub = t.image_sub_buckets_sizes[indice]
-                ar_error = ar_errors[indice]
-                resized, alpha_mask  = resize_and_crop(ar_error, image, *sub, t.image_disable_upscale)
-                if resized is not None:
-                    t.image_buckets_raw[sub].append([resized, alpha_mask, load_text_files(txt_path), load_text_files(cap_path), filename, img_path, targ_path])
+                idx = np.argmin(np.abs(ar_errors))
+                sub = t.image_sub_buckets_sizes[idx]
+                err = ar_errors[idx]
+                res, msk = resize_and_crop(err, image, *sub, t.image_disable_upscale)
+                if res is not None:
+                    t.image_buckets_raw[sub].append([res, msk, load_text_files(txt_path), load_text_files(cap_path), filename, img_path, targ_path])
                     if t.image_mirroring:
-                        flipped = resized.transpose(Image.FLIP_LEFT_RIGHT)
-                        flipped_mask = torch.flip(alpha_mask, [1]) if alpha_mask is not None else None
+                        flipped = res.transpose(Image.FLIP_LEFT_RIGHT)
+                        flipped_mask = torch.flip(msk, [1]) if msk is not None else None
                         t.image_buckets_raw[sub].append([flipped, flipped_mask, load_text_files(txt_path), load_text_files(cap_path), filename, img_path+"m", targ_path+"m" if targ_path is not None else targ_path])
-                
-                ar_errors[indice] = ar_errors[indice] + 1
+                ar_errors[idx] += 1
         except:
-            print("Failed to make sub-buckets; image bucket step or image minimum length is too big?")
+            pass
 
     for key in t.image_buckets_raw:
         count = len(t.image_buckets_raw[key])
@@ -495,7 +519,11 @@ def encode_image_text(t):
                 is_texture = len(entry) == 8 and entry[7]
                 image, mask, text, caption, filename, img_path, targ_path = entry[:7]
 
-                latent = t.image2latent(t,image)
+                if not is_texture:
+                    latent = t.image2latent(t, image)
+                else:
+                    latent = None
+
                 if t.image_use_filename_as_tag:
                     prompt = t.lora_trigger_word + "," + filename
                 elif text is not None:
@@ -511,12 +539,13 @@ def encode_image_text(t):
                     emb1 = emb2 = prompt
 
                 if is_texture:
-                    # Store the crop latent + canvas dimensions; LatentsConds places it
-                    # randomly at training time to give positional invariance.
-                    # mask here is the alpha crop mask (or None) derived at load time.
-                    canvas_hw = (key[1], key[0])  # (height, width) in pixels; key is (W, H)
+                    canvas_hw = (key[1], key[0])
                     tile_res = getattr(t, 'texture_tile_resolution', 0)
-                    t.image_buckets[key].append([latent, mask, emb1, emb2, canvas_hw, tile_res])
+                    tile_scale = getattr(t, 'texture_tile_scale', 1.0)
+                    t.image_buckets[key].append([
+                        "texture_source", image, mask,
+                        emb1, emb2, canvas_hw, tile_res, tile_scale
+                    ])
                 else:
                     t.image_buckets[key].append([latent, mask, emb1, emb2])
                 bar.update(1)
@@ -539,7 +568,7 @@ def encode_image_text(t):
                             mask = torch.where(mask > 10, torch.tensor(1, dtype=torch.uint8), torch.tensor(0, dtype=torch.uint8))
 
                             mask = mask.float()
-                            dilation = 33 # ~4 latent pixels after 8x downsample
+                            dilation = 33
                             mask = F.max_pool2d(mask.unsqueeze(0).unsqueeze(0).cuda(), kernel_size=dilation, stride=1, padding=dilation // 2)[0, 0].cpu()
                             save_image1(t, mask * 255, "mask", name=img_path_key)
                             mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(latent.shape[2], latent.shape[3]), mode='nearest')[0, 0]
@@ -566,10 +595,10 @@ def save_image1(t, image, dirname="", name=None):
         if image.ndim == 3 and image.shape[0] == 1:
             image = image.squeeze(0)
 
-        if image.ndim == 2:  # 2D配列ならグレースケール画像
+        if image.ndim == 2:
             image = Image.fromarray(image.astype(np.uint8), mode='L')
         elif image.ndim == 3:
-            if image.shape[0] in [3, 4]:  # (C, H, W) 形式なら (H, W, C) に変換
+            if image.shape[0] in [3, 4]:
                 image = np.moveaxis(image, 0, -1)
             image = Image.fromarray(image.astype(np.uint8))
         else:

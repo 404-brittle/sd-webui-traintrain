@@ -96,6 +96,14 @@ train_repeat        = ["train_repeat",       "TX", None, 1,    int,   ALL]
 gradient_accumulation_steps = ["gradient_accumulation_steps","TX", None, "1", str, ALL]
 train_min_timesteps = ["train_min_timesteps","TX", None, 0,    int,   ALL]
 train_max_timesteps = ["train_max_timesteps","TX", None, 1000, int,   ALL]
+# Inline timestep curriculum schedule.  When non-empty, overrides train_min/max_timesteps.
+# Format: one entry per line — step_pct  t_min  t_max  [weight_fn]  [mode]
+# weight_fn: flat | gaussian:center:sigma | linear:lo_w:hi_w
+# mode: texture | fullres (only used when train_hybrid_mode is enabled)
+train_ts_schedule   = ["train_ts_schedule",   "ML", None, "",   str,   ALL]
+# Hybrid mode: use the same dataset as both texture patches (detail steps) and
+# full-res images (layout steps), switching automatically based on the schedule mode column.
+train_hybrid_mode   = ["train_hybrid_mode",   "CH", None, False, bool, ALL]
 # Regex-based sub-layer filter.  Comma/newline separated; prefix with ! to exclude.
 # Examples:  "!adaln_modulation"   →  skip adaln (recommended for Anima)
 #            "attn, mlp"           →  attention + MLP only
@@ -117,7 +125,7 @@ o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps]
-o_column4 = [train_min_timesteps, train_max_timesteps, network_module_filter, network_llrd_decay]
+o_column4 = [train_min_timesteps, train_max_timesteps, train_ts_schedule, train_hybrid_mode, network_module_filter, network_llrd_decay]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 
@@ -133,6 +141,8 @@ def makeui(sets, pas = 0):
                 output.append(gr.Dropdown(label=name.replace("_"," "), choices=choices, value=value if value else choices[0] , elem_id="tt_" + name, visible = visible))
             if uitype == "TX":
                 output.append(gr.Textbox(label=name.replace("_"," "),value = value, elem_id="tt_" +add_id + name, visible = visible))
+            if uitype == "ML":
+                output.append(gr.Textbox(label=name.replace("_"," "),value = value, elem_id="tt_" +add_id + name, visible = visible, lines=6))
             if uitype == "CH":
                 output.append(gr.Checkbox(label=name.replace("_"," "),value = value, elem_id="tt_" + name, visible = visible))
             if uitype == "CB":

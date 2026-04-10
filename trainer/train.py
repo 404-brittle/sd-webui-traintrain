@@ -261,12 +261,31 @@ def train_lora(t):
     loss_ema = None
     loss_velocity = None
 
-    if not getattr(t, 'texture_mode', False):
+    _train_hybrid = getattr(t, 'train_hybrid_mode', False)
+    # VAE must stay alive for JIT encoding: texture_mode OR hybrid mode
+    if not getattr(t, 'texture_mode', False) and not _train_hybrid:
         del t.vae
         if "BASE" not in t.network_blocks:
             del t.text_model
 
     flush()
+
+    # Parse timestep curriculum schedule from inline config text (optional)
+    _ts_schedule = _parse_ts_schedule_text(getattr(t, 'train_ts_schedule', '') or '')
+    if _ts_schedule:
+        print(f"Timestep schedule loaded: {len(_ts_schedule)} entries"
+              + (", hybrid mode active" if _train_hybrid else ""))
+
+    # Prime hybrid processing mode before the first batch is fetched
+    def _set_hybrid_mode(step_pct):
+        if not _train_hybrid:
+            return
+        mode = ""
+        if _ts_schedule:
+            mode = _resolve_ts_entry(_ts_schedule, step_pct)[3]
+        t.hybrid_processing_mode = mode or "texture"
+
+    _set_hybrid_mode(0.0)
 
     pbar = tqdm(range(t.train_iterations))
     while t.train_iterations >= pbar.n:
@@ -278,8 +297,19 @@ def train_lora(t):
                 noise = torch.randn_like(latents)
                 batch_size = latents.shape[0]
 
-                ts_lo = max(0, t.train_min_timesteps)
-                ts_hi = max(ts_lo + 1, min(1000, t.train_max_timesteps))
+                # Resolve timestep range and optional LR override from schedule (or static config)
+                step_pct = pbar.n / max(1, t.train_iterations - 1)
+                if _ts_schedule is not None:
+                    _entry = _resolve_ts_entry(_ts_schedule, step_pct)
+                    ts_lo, ts_hi, _lr_override = _entry[1], _entry[2], _entry[4]
+                    if _lr_override is not None:
+                        for pg in optimizer.param_groups:
+                            pg['lr'] = _lr_override
+                else:
+                    ts_lo, ts_hi = t.train_min_timesteps, t.train_max_timesteps
+                ts_lo = max(0, ts_lo)
+                ts_hi = max(ts_lo + 1, min(1000, ts_hi))
+
                 flow_shift = getattr(t, 'train_flow_shift', 3.0)
                 n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
                 timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, flow_shift, CUDA)
@@ -303,15 +333,17 @@ def train_lora(t):
                 train_mask = batch.get("mask")
                 if train_mask is not None:
                     train_mask = train_mask.to(CUDA)
+
                 loss, loss_ema, loss_velocity = process_loss(
                     t, model_pred, velocity_target, timesteps, loss_ema, loss_velocity,
                     mask=train_mask,
                 )
 
                 c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
+                _mode_tag = f"/{t.hybrid_processing_mode}" if _train_hybrid and hasattr(t, 'hybrid_processing_mode') else ""
                 pbar.set_description(
-                    f"Loss EMA * 1000: {loss_ema * 1000:.4f}, Current LR: " + ", ".join(c_lrs) +
-                    f", Epoch: {t.dataloader.epoch}"
+                    f"Loss EMA * 1000: {loss_ema * 1000:.4f}, LR: " + ", ".join(c_lrs) +
+                    f", TS: {ts_lo}-{ts_hi}{_mode_tag}, Epoch: {t.dataloader.epoch}"
                 )
                 pbar.update(1)
 
@@ -327,6 +359,9 @@ def train_lora(t):
 
                 del model_pred
                 flush()
+
+                # Update hybrid mode for the NEXT batch fetch (1-step ahead)
+                _set_hybrid_mode(pbar.n / max(1, t.train_iterations - 1))
 
                 result = finisher(network, t, pbar.n)
                 if result is not None:
@@ -508,6 +543,76 @@ def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, flow_shift: float, device)
     return ts
 
 
+# --------------------------------------------------------------------------- #
+# Timestep schedule                                                            #
+# --------------------------------------------------------------------------- #
+
+def _parse_ts_schedule_text(text: str):
+    """Parse a timestep schedule from inline text (stored directly in the config).
+
+    Format — one entry per non-comment line::
+
+        # Columns: step_pct   t_min   t_max   [mode]   [lr]
+        #
+        # step_pct  0.0–1.0, fraction of total training steps at which row activates
+        # mode      texture | fullres | - (- or blank = keep current mode)
+        # lr        effective learning rate for this phase (e.g. 1e-4); omit to keep scheduler value
+        #
+        # Weighting is always flat (uniform).
+        # Step-function: the LAST row whose step_pct ≤ current fraction is active.
+        # Example — curriculum that widens range, switches mode, and adjusts LR:
+        #
+        # 0.00   200   800   fullres   1e-4
+        # 0.40     0   700   texture   5e-5
+        # 0.70     0  1000   texture
+
+    Returns a sorted list of (step_pct, ts_lo, ts_hi, mode, lr_override) tuples,
+    or None if text is empty / contains no valid entries.
+    lr_override is a float or None if not specified.
+    """
+    entries = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            continue  # ignore legacy section headers gracefully
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            mode = parts[3].lower() if len(parts) > 3 else ""
+            if mode == "-":
+                mode = ""
+            lr_override = float(parts[4]) if len(parts) > 4 else None
+            entry = (
+                float(parts[0]),
+                int(parts[1]),
+                int(parts[2]),
+                mode,
+                lr_override,
+            )
+        except (ValueError, IndexError):
+            continue
+        entries.append(entry)
+
+    if not entries:
+        return None
+    entries.sort(key=lambda e: e[0])
+    return entries   # list of (step_pct, ts_lo, ts_hi, mode, lr_override)
+
+
+def _resolve_ts_entry(entries: list, step_pct: float):
+    """Step-function lookup: return the last entry whose step_pct ≤ current."""
+    result = entries[0]
+    for e in entries:
+        if e[0] <= step_pct:
+            result = e
+        else:
+            break
+    return result  # (step_pct, ts_lo, ts_hi, mode, lr_override)
+
+
 def create_network(t):
     network = load_network(t)
     optimizer = trainer.get_optimizer(
@@ -591,7 +696,8 @@ def makesavelist(t):
         t.save_list = []
 
 
-def process_loss(t, original, target, timesteps, loss_ema, loss_velocity, mask=None, copy=False):
+def process_loss(t, original, target, timesteps, loss_ema, loss_velocity,
+                 mask=None, copy=False, ts_weights=None):
     if t.train_loss_function == "MSE":
         loss = torch.nn.functional.mse_loss(original.float(), target.float(), reduction="none")
     elif t.train_loss_function == "L1":
@@ -611,8 +717,15 @@ def process_loss(t, original, target, timesteps, loss_ema, loss_velocity, mask=N
         m = m.expand_as(loss)
         loss = (loss * m).sum(dim=[1, 2, 3]) / m.sum(dim=[1, 2, 3]).clamp(min=1e-8)
     else:
-        loss = loss.mean([1, 2, 3])
-    loss = loss.mean()
+        loss = loss.mean([1, 2, 3])   # [B]
+
+    # Per-timestep loss weighting: downweight artifact-prone timestep extremes.
+    # ts_weights is [B] in (0, 1]; None means flat (no reweighting).
+    if ts_weights is not None and ts_weights.shape[0] == loss.shape[0]:
+        w = ts_weights.to(loss.device)
+        loss = (loss * w).sum() / w.sum().clamp(min=1e-8)
+    else:
+        loss = loss.mean()
 
     if loss_ema is None:
         loss_ema = loss.item()

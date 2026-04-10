@@ -79,14 +79,69 @@ def _squeeze_cond(cond):
     return cond
 
 
+def _freq_matched_background(tile: torch.Tensor, canvas_h: int, canvas_w: int) -> torch.Tensor:
+    """Generate a canvas-sized background whose power spectrum matches `tile` but with
+    completely randomised spatial phase.
+
+    The tile has real spatial structure (correlated adjacent latent pixels).  Plain
+    i.i.d. N(μ,σ²) noise has no such correlations.  At intermediate timesteps (~300–700)
+    the model can detect the "correlated region vs. uncorrelated region" boundary in the
+    forward-pass input even though the loss mask zeroes it out, causing boundary/tiling
+    artefacts in the trained LoRA.
+
+    By matching the power spectrum we make the background statistically indistinguishable
+    from texture content: same spatial frequency distribution, different specific content
+    every call.  The model's attention cannot consistently find a boundary.
+
+    Concretely: take the per-channel 2-D FFT of the tile, resample the magnitude spectrum
+    to canvas size, multiply by a fresh unit-complex random phase, then IFFT.
+    """
+    C = tile.shape[0]
+
+    # Per-channel FFT of the tile (real-to-complex)
+    tile_fft = torch.fft.rfft2(tile.float())           # [C, th, tw//2+1]  complex
+    tile_mag = tile_fft.abs()                          # [C, th, tw//2+1]  real
+
+    # Resample tile magnitude spectrum to canvas FFT dimensions
+    tile_mag_resized = F.interpolate(
+        tile_mag.unsqueeze(0),                         # [1, C, th, tw//2+1]
+        size=(canvas_h, canvas_w // 2 + 1),
+        mode='bilinear', align_corners=False,
+    ).squeeze(0)                                       # [C, canvas_h, canvas_w//2+1]
+
+    # Random unit-complex phase (fresh every call) — on same device as tile
+    rand_angle = torch.rand(C, canvas_h, canvas_w // 2 + 1, device=tile_mag_resized.device) * (2 * math.pi)
+    rand_phase = torch.polar(torch.ones_like(rand_angle), rand_angle)  # unit complex
+
+    # Apply magnitude from tile, random phase
+    result_fft = tile_mag_resized * rand_phase
+    result = torch.fft.irfft2(result_fft, s=(canvas_h, canvas_w))      # [C, H, W]
+
+    return result.to(tile.dtype)
+
+
 def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px: int,
                         alpha_crop: torch.Tensor | None = None,
                         tile_px: int | None = None):
-    """Randomly sample a square tile from the (pre-scaled) image latent, then place it
-    at a random position in a zero-padded canvas and return a feathered mask.
+    """Place a square tile from the (pre-scaled) image latent at a random position on a
+    canvas whose background is filled with frequency-matched noise, and return a feathered
+    mask that is non-zero only over the tile region.
 
-    Both the source position and (when tile_px is None) tile size are re-sampled every
-    call, so each DataLoader worker draw gives positional/scale variance.
+    Background fill uses _freq_matched_background: noise with the tile's power spectrum
+    but randomised spatial phase.  This makes the background statistically
+    indistinguishable from real texture content — same spatial correlation structure,
+    different specific values every call.  Plain N(μ,σ²) noise lacks spatial correlations
+    and creates a detectable "correlated vs. uncorrelated" boundary in the forward pass at
+    intermediate timesteps (~300–700), even though the loss mask zeroes it out, leading to
+    boundary/tiling artefacts in the trained LoRA.  Frequency-matched noise eliminates
+    this boundary at all timestep levels, allowing the full 0–1000 range without
+    positional or boundary leakage.
+
+    The mask remains zero outside the tile: the background has no learnable target, so
+    including it in the loss would only add gradient variance.
+
+    Both the source position within the image latent and (when tile_px is None) tile size
+    are re-sampled every call, giving positional/scale variance across DataLoader draws.
 
     Args:
         crop_latent: encoded latent of the (already tile-scaled) image, any size.
@@ -106,7 +161,7 @@ def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px:
     clat_h, clat_w = canvas_h // 8, canvas_w // 8
 
     crop = crop_latent.squeeze(0)          # [C, img_h, img_w]
-    C, ih, iw = crop.shape
+    _, ih, iw = crop.shape
 
     # --- Determine square tile size in latent space ---
     if tile_px is not None:
@@ -131,7 +186,10 @@ def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px:
     oy = random.randint(0, max_oy)
     ox = random.randint(0, max_ox)
 
-    canvas = torch.zeros(C, clat_h, clat_w, dtype=crop.dtype)
+    # Fill background with frequency-matched noise: same power spectrum as the tile
+    # but randomised spatial phase, so the background looks like texture-like content
+    # with no consistent boundary the model can detect or memorise.
+    canvas = _freq_matched_background(tile, clat_h, clat_w)
     canvas[:, oy:oy + th, ox:ox + tw] = tile
 
     # Feathered mask: cosine taper over `feather` latent pixels from every edge
@@ -197,7 +255,33 @@ class LatentsConds(Dataset):
             # Detect JIT texture source
             if isinstance(item, list) and item[0] == "texture_source":
                 _, image, mask, emb1, emb2, canvas_hw, tile_res, tile_scale = item
-                
+
+                _TEXTURE_CANVAS_PRESETS = [
+                    (640, 1536), (1536, 640),
+                    (832, 1216), (1216, 832),
+                    (1024, 1024),
+                ]
+
+                # Hybrid fullres mode: resize entire image to a canvas matching its
+                # aspect ratio and encode — no crop, no mask, no canvas noise.
+                if getattr(self.t, 'hybrid_processing_mode', None) == "fullres":
+                    img_ar = image.width / image.height
+                    canvas_hw = min(_TEXTURE_CANVAS_PRESETS,
+                                    key=lambda hw: abs(hw[1] / hw[0] - img_ar))
+                    canvas_h, canvas_w = canvas_hw
+                    img_resized = image.resize((canvas_w, canvas_h), Image.LANCZOS)
+                    latent = self.t.image2latent(self.t, img_resized)
+                    mask = None
+                    cond1, cond2 = emb1, emb2
+                    batch["batch_type"] = "fullres"
+                    batch["latent"] = latent.squeeze().cpu()
+                    if cond1 is not None: batch["cond1"] = cond1 if isinstance(cond1, (str, tuple, list)) else cond1.squeeze().cpu()
+                    if cond2 is not None: batch["cond2"] = cond2 if isinstance(cond2, (str, tuple, list)) else cond2.squeeze().cpu()
+                    return batch
+
+                # Randomise canvas resolution each step for aspect-ratio invariance
+                canvas_hw = random.choice(_TEXTURE_CANVAS_PRESETS)
+
                 # JIT: Randomly crop, scale, and encode
                 canvas_h, canvas_w = canvas_hw
                 clat_h, clat_w = canvas_h // 8, canvas_w // 8
@@ -282,6 +366,7 @@ class LatentsConds(Dataset):
                 )
                 
                 cond1, cond2 = emb1, emb2
+                batch["batch_type"] = "texture"
             else:
                 if len(item) == 6:
                     latent, alpha_crop_mask, cond1, cond2, canvas_hw, tile_res = item
@@ -301,6 +386,9 @@ class LatentsConds(Dataset):
                         alpha_crop=alpha_crop_mask,
                         tile_px=tile_res if tile_res > 0 else None,
                     )
+                    batch["batch_type"] = "texture"
+                else:
+                    batch["batch_type"] = "fullres"
 
             batch["latent"] = latent.squeeze().cpu()
             if cond1 is not None: batch["cond1"] = cond1 if isinstance(cond1, (str, tuple, list)) else cond1.squeeze().cpu()
@@ -439,8 +527,8 @@ def load_resize_image_and_text(t):
         if pair_size is not None and image.size != pair_size:
             image = image.resize(pair_size, Image.LANCZOS)
 
-        # --- Texture mode ---
-        if getattr(t, 'texture_mode', False):
+        # --- Texture mode OR hybrid mode (all images stored as JIT PIL sources) ---
+        if getattr(t, 'texture_mode', False) or getattr(t, 'train_hybrid_mode', False):
             canvas_key = (t.image_size[0], t.image_size[0])
 
             # JIT UPDATE: Store raw PIL objects

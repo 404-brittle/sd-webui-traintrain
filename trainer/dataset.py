@@ -225,6 +225,7 @@ class LatentsConds(Dataset):
         self.revert = t.diff_revert_original_target
         self.texture_feather_latent_px = getattr(t, 'texture_feather_latent_px', 2)
         self.texture_energy_threshold = getattr(t, 'texture_energy_threshold', 0)
+        self.texture_avoid_masked = getattr(t, 'texture_avoid_masked', True)
         # image_num_multiply hardcoded to 1
         if t.train_batch_size > len(self.latents_conds):
             self.latents_conds = self.latents_conds * t.train_batch_size
@@ -288,9 +289,22 @@ class LatentsConds(Dataset):
                 
                 best_crop = None
                 best_energy = -1
-                
-                # Attempt up to 10 random crops to find one with enough "energy" (detail/edges)
-                max_attempts = 10 if self.texture_energy_threshold > 0 else 1
+                best_mask_score = -1.0
+
+                # Pre-compute full-resolution mask as numpy for fast per-crop mean.
+                # Only built when texture_avoid_masked is set; None disables all
+                # mask scoring so the loop runs just once and takes the first crop.
+                mask_np_full = None
+                if mask is not None and self.texture_avoid_masked:
+                    mask_np_full = np.array(mask.convert("L"), dtype=np.float32) / 255.0
+
+                has_mask   = mask_np_full is not None
+                use_energy = self.texture_energy_threshold > 0
+                max_attempts = 10 if (has_mask or use_energy) else 1
+
+                best_ms         = -1.0
+                best_energy_val = -1.0
+
                 for attempt in range(max_attempts):
                     # Resolve tile size in pixels
                     if tile_res > 0:
@@ -302,46 +316,45 @@ class LatentsConds(Dataset):
                         min_tile_lat = max(1, max_tile_lat // 4)
                         tile_lat = random.randint(min_tile_lat, max_tile_lat)
                         tile_px = tile_lat * 8
-                    
+
                     src_px = max(8, round(tile_px / tile_scale))
                     src_px = min(src_px, image.width, image.height)
                     tile_px = round(src_px * tile_scale)
-                    
+
                     src_y = random.randint(0, image.height - src_px)
                     src_x = random.randint(0, image.width - src_px)
-                    
+
                     candidate_crop = image.crop((src_x, src_y, src_x + src_px, src_y + src_px))
-                    
-                    # If threshold is enabled, check energy (Laplacian variance)
-                    if self.texture_energy_threshold > 0:
-                        # Convert to grayscale numpy for lightweight calculation
+
+                    # Mask score: 1.0 = no masked pixels, <1.0 = some masked pixels
+                    mask_score = 1.0
+                    if has_mask:
+                        m_region = mask_np_full[src_y:src_y + src_px, src_x:src_x + src_px]
+                        mask_score = float(m_region.mean())
+
+                    # Energy: Laplacian variance; mask zeroes out masked contributions
+                    energy = 0.0
+                    if use_energy:
                         gray = np.array(candidate_crop.convert("L"), dtype=np.float32) / 255.0
-                        # Simple 3x3 Laplacian kernel
                         laplace = (
                             gray[1:-1, 1:-1] * 4 -
                             gray[:-2, 1:-1] - gray[2:, 1:-1] -
                             gray[1:-1, :-2] - gray[1:-1, 2:]
                         )
-                        
-                        # Factor in mask if present (masked-off areas have 0 energy)
-                        if mask is not None:
-                            # Crop and resize mask to align with the [1:-1, 1:-1] laplacian dimensions
+                        if has_mask:
                             m_crop = mask.crop((src_x, src_y, src_x + src_px, src_y + src_px))
                             m_crop = m_crop.convert("L").resize((src_px - 2, src_px - 2), Image.BILINEAR)
+                            laplace = laplace * (np.array(m_crop).astype(np.float32) / 255.0)
+                        energy = float(np.var(laplace))
 
-                            m_np = np.array(m_crop).astype(np.float32) / 255.0
-                            laplace = laplace * m_np
-
-                        energy = np.var(laplace)
-                        
-                        if energy > best_energy:
-                            best_energy = energy
-                            best_crop = (candidate_crop, src_x, src_y, src_px, tile_px)
-                        
-                        if energy >= self.texture_energy_threshold:
-                            break
-                    else:
+                    # Update best: mask coverage PRIMARY, energy secondary tiebreak
+                    if mask_score > best_ms or (mask_score == best_ms and energy > best_energy_val):
+                        best_ms         = mask_score
+                        best_energy_val = energy
                         best_crop = (candidate_crop, src_x, src_y, src_px, tile_px)
+
+                    # Early accept: zero masked pixels AND energy threshold satisfied
+                    if mask_score >= 1.0 and (not use_energy or energy >= self.texture_energy_threshold):
                         break
 
                 

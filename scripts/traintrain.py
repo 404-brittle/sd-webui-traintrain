@@ -96,6 +96,7 @@ train_repeat        = ["train_repeat",       "TX", None, 1,    int,   ALL]
 gradient_accumulation_steps = ["gradient_accumulation_steps","TX", None, "1", str, ALL]
 train_min_timesteps = ["train_min_timesteps","TX", None, 0,    int,   ALL]
 train_max_timesteps = ["train_max_timesteps","TX", None, 1000, int,   ALL]
+train_flow_shift    = ["train_flow_shift",   "TX", None, 3.0, float, ALL]
 # Inline timestep curriculum schedule.  When non-empty, overrides train_min/max_timesteps.
 # Format: one entry per line — step_pct  t_min  t_max  [weight_fn]  [mode]
 # weight_fn: flat | gaussian:center:sigma | linear:lo_w:hi_w
@@ -125,7 +126,7 @@ o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps]
-o_column4 = [train_min_timesteps, train_max_timesteps, train_ts_schedule, train_hybrid_mode, network_module_filter, network_llrd_decay]
+o_column4 = [train_min_timesteps, train_max_timesteps, train_flow_shift, train_ts_schedule, train_hybrid_mode, network_module_filter, network_llrd_decay]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 
@@ -303,19 +304,18 @@ def on_ui_tabs():
                     col4_o1 = makeui(o_column4)
 
             model_col_grs = [qwen3_gr, t5_gr]
-            train_settings_1 = model_col_grs + col1_r1 + col2_r1 + col3_r1 + col1_o1 + col2_o1 + col3_o1 + col4_o1 + [dummy]
+            all_gr = model_col_grs + col1_r1 + col2_r1 + col3_r1 + col1_o1 + col2_o1 + col3_o1 + col4_o1
+            train_settings_1 = all_gr + [dummy]
 
-            # --- Layer browser: live regex preview --------------------------------
-            # col4_o1 indices: 0=train_min_timesteps, 1=train_max_timesteps,
-            #                  2=network_module_filter
-            _filter_gr = col4_o1[2]
+            # Layer browser: look up the filter widget by config-object identity —
+            # immune to reordering within all_gr.
+            _filter_gr = all_gr[trainer.all_configs.index(network_module_filter)]
             with gr.Row():
                 layer_preview = gr.HTML(
                     value=render_layer_preview(""),
                     label="Layer browser",
                 )
             _filter_gr.change(render_layer_preview, inputs=[_filter_gr], outputs=[layer_preview])
-            # ----------------------------------------------------------------------
 
             with gr.Group(visible=False) as g_diff:
                 gr.HTML(value="Image Pairs (Original → Target)")

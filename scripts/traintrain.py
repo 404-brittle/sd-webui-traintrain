@@ -97,6 +97,14 @@ gradient_accumulation_steps = ["gradient_accumulation_steps","TX", None, "1", st
 train_min_timesteps = ["train_min_timesteps","TX", None, 0,    int,   ALL]
 train_max_timesteps = ["train_max_timesteps","TX", None, 1000, int,   ALL]
 train_flow_shift    = ["train_flow_shift",   "TX", None, 3.0, float, ALL]
+# Distribution used to sample training timesteps.
+# "uniform"      — flat randint within [min, max]
+# "flow_shift"   — bias toward high-noise end via shift factor (train_flow_shift)
+# "logit_normal" — sigmoid of Normal(mean, std); params: mean=0.0 std=1.0
+# "cosmap"       — cosine-based bijection; bias toward mid-noise
+TIMESTEP_DISTRIBUTIONS = ["uniform", "flow_shift", "logit_normal", "cosmap", "beta"]
+train_timestep_distribution = ["train_timestep_distribution", "DD", TIMESTEP_DISTRIBUTIONS, "flow_shift", str, ALL]
+train_ts_dist_params = ["train_ts_dist_params(e.g. mean=0.0 std=1.0)", "TX", None, "", str, ALL]
 # Inline timestep curriculum schedule.  When non-empty, overrides train_min/max_timesteps.
 # Format: one entry per line — step_pct  t_min  t_max  [weight_fn]  [mode]
 # weight_fn: flat | gaussian:center:sigma | linear:lo_w:hi_w
@@ -126,11 +134,12 @@ o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps]
-o_column4 = [train_min_timesteps, train_max_timesteps, train_flow_shift, train_ts_schedule, train_hybrid_mode, network_module_filter, network_llrd_decay]
+o_ts_column    = [train_min_timesteps, train_max_timesteps, train_timestep_distribution, train_ts_dist_params, train_ts_schedule, train_hybrid_mode]
+o_layer_column = [network_module_filter, network_llrd_decay]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 
-trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + o_column1 + o_column2 + o_column3 + o_column4
+trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + o_column1 + o_column2 + o_column3 + o_ts_column + o_layer_column
 
 def makeui(sets, pas = 0):
     output = []
@@ -153,6 +162,248 @@ def makeui(sets, pas = 0):
     return output
 
 _PREVIEW_KEYS = generate_anima_preview_keys()   # generated once at import time
+
+# Accent colour per distribution type for the visualisation
+_DIST_COLORS = {
+    "uniform":      "#60a5fa",  # blue
+    "flow_shift":   "#4ade80",  # green
+    "logit_normal": "#f472b6",  # pink
+    "cosmap":       "#fb923c",  # orange
+    "beta":         "#a78bfa",  # violet
+}
+
+
+def _compute_ts_density(dist_type: str, ts_lo: int, ts_hi: int,
+                         dist_params: str, n_bins: int = 50) -> list:
+    """Return a list of n_bins normalised density values covering [0, 1000].
+
+    All maths is pure Python so no extra imports are needed at module load time.
+    """
+    import math
+
+    ts_lo = max(0, int(ts_lo))
+    ts_hi = max(ts_lo + 1, min(1000, int(ts_hi)))
+    span = ts_hi - ts_lo
+    bin_size = 1000.0 / n_bins
+    density = [0.0] * n_bins
+
+    # Parse "key=value ..." pairs from dist_params
+    params: dict = {}
+    for item in (dist_params or "").replace(",", " ").split():
+        if "=" in item:
+            k, v = item.split("=", 1)
+            try:
+                params[k.strip()] = float(v.strip())
+            except ValueError:
+                pass
+
+    if dist_type == "uniform":
+        for b in range(n_bins):
+            lo = b * bin_size
+            hi = lo + bin_size
+            overlap = max(0.0, min(float(ts_hi), hi) - max(float(ts_lo), lo))
+            density[b] = overlap / bin_size
+
+    elif dist_type == "flow_shift":
+        shift = max(1e-3, params.get("shift", 3.0))
+        # CDF in sigma space: F(s) = s*shift / (1 + (shift-1)*s)
+        def _fs_cdf(s):
+            return s * shift / (1.0 + (shift - 1.0) * s)
+        for b in range(n_bins):
+            lo = b * bin_size
+            hi = lo + bin_size
+            if hi <= ts_lo or lo >= ts_hi:
+                continue
+            s_lo = max(0.0, (max(lo, float(ts_lo)) - ts_lo) / span)
+            s_hi = min(1.0, (min(hi, float(ts_hi)) - ts_lo) / span)
+            if s_hi > s_lo:
+                density[b] = (_fs_cdf(s_hi) - _fs_cdf(s_lo)) / (bin_size / 1000.0)
+
+    elif dist_type == "logit_normal":
+        mean = params.get("mean", 0.0)
+        std = max(0.01, params.get("std", 1.0))
+        INV_SQRT2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+        def _normal_pdf(x):
+            return INV_SQRT2PI * math.exp(-0.5 * x * x)
+
+        for b in range(n_bins):
+            lo = b * bin_size
+            hi = lo + bin_size
+            if hi <= ts_lo or lo >= ts_hi:
+                continue
+            # Numerical integration (8-point midpoint rule in sigma space)
+            lo_t = max(float(ts_lo) + 0.001 * span, lo)
+            hi_t = min(float(ts_hi) - 0.001 * span, hi)
+            if hi_t <= lo_t:
+                continue
+            n_pts, val = 8, 0.0
+            for i in range(n_pts):
+                t = lo_t + (hi_t - lo_t) * (i + 0.5) / n_pts
+                sigma = max(1e-6, min(1.0 - 1e-6, (t - ts_lo) / span))
+                logit = math.log(sigma / (1.0 - sigma))
+                pdf_sigma = _normal_pdf((logit - mean) / std) / (std * sigma * (1.0 - sigma))
+                val += pdf_sigma / span * (hi_t - lo_t) / n_pts
+            density[b] = val
+
+    elif dist_type == "cosmap":
+        # sigma = 1 - 1/(tan(pi/2*u)+1)  →  PDF in sigma = 2/pi / (s^2 + (1-s)^2)
+        TWO_OVER_PI = 2.0 / math.pi
+        for b in range(n_bins):
+            lo = b * bin_size
+            hi = lo + bin_size
+            if hi <= ts_lo or lo >= ts_hi:
+                continue
+            lo_t = max(float(ts_lo), lo)
+            hi_t = min(float(ts_hi), hi)
+            if hi_t <= lo_t:
+                continue
+            n_pts, val = 8, 0.0
+            for i in range(n_pts):
+                t = lo_t + (hi_t - lo_t) * (i + 0.5) / n_pts
+                sigma = max(1e-6, min(1.0 - 1e-6, (t - ts_lo) / span))
+                pdf_sigma = TWO_OVER_PI / (sigma ** 2 + (1.0 - sigma) ** 2)
+                val += pdf_sigma / span * (hi_t - lo_t) / n_pts
+            density[b] = val
+
+    elif dist_type == "beta":
+        # Beta(alpha, beta) PDF: Γ(a+b)/(Γ(a)Γ(b)) * s^(a-1) * (1-s)^(b-1)
+        # alpha=beta=0.5 → inverse bell (arcsine / U-shape)
+        # alpha=beta=1   → uniform
+        # alpha=beta>1   → bell; alpha≠beta → skewed
+        a = max(0.01, params.get("alpha", 0.5))
+        b = max(0.01, params.get("beta",  0.5))
+        try:
+            log_norm = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        except ValueError:
+            log_norm = 0.0
+        for bn in range(n_bins):
+            lo = bn * bin_size
+            hi = lo + bin_size
+            if hi <= ts_lo or lo >= ts_hi:
+                continue
+            lo_t = max(float(ts_lo), lo)
+            hi_t = min(float(ts_hi), hi)
+            if hi_t <= lo_t:
+                continue
+            n_pts, val = 8, 0.0
+            for i in range(n_pts):
+                t = lo_t + (hi_t - lo_t) * (i + 0.5) / n_pts
+                sigma = max(1e-6, min(1.0 - 1e-6, (t - ts_lo) / span))
+                log_pdf = log_norm + (a - 1.0) * math.log(sigma) + (b - 1.0) * math.log(1.0 - sigma)
+                pdf_sigma = math.exp(log_pdf)
+                val += pdf_sigma / span * (hi_t - lo_t) / n_pts
+            density[bn] = val
+
+    max_d = max(density) if any(d > 0 for d in density) else 1.0
+    return [d / max_d for d in density]
+
+
+def render_timestep_distribution(dist_type, ts_min, ts_max, dist_params) -> str:
+    """Return an HTML snippet containing an SVG bar chart of the timestep distribution."""
+    import math
+
+    try:
+        ts_lo = max(0, int(float(ts_min or 0)))
+        ts_hi = max(ts_lo + 1, min(1000, int(float(ts_max or 1000))))
+    except (ValueError, TypeError):
+        ts_lo, ts_hi = 0, 1000
+
+    dist_type = dist_type or "flow_shift"
+    n_bins = 50
+    density = _compute_ts_density(dist_type, ts_lo, ts_hi, dist_params or "", n_bins)
+
+    # SVG layout
+    W, H = 500, 74
+    bar_area_h = 54
+    bar_w = W / n_bins
+    bin_size = 1000.0 / n_bins
+    color = _DIST_COLORS.get(dist_type, "#60a5fa")
+
+    bars = []
+    for b, d in enumerate(density):
+        bin_lo = b * bin_size
+        bin_hi = bin_lo + bin_size
+        in_range = bin_lo < ts_hi and bin_hi > ts_lo
+        x = b * bar_w
+        h = max(0.0, d * bar_area_h)
+        y = bar_area_h - h
+        fill = color if in_range else "#252525"
+        bars.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w - 0.8:.1f}" height="{h:.1f}" fill="{fill}" rx="0.5"/>'
+        )
+
+    # Axis ticks and labels
+    ticks = []
+    for t_val, t_lbl in [(0, "0"), (250, "250"), (500, "500"), (750, "750"), (1000, "1000")]:
+        x = t_val / 1000.0 * W
+        ticks.append(
+            f'<line x1="{x:.1f}" y1="{bar_area_h}" x2="{x:.1f}" y2="{bar_area_h + 3}" stroke="#555" stroke-width="0.5"/>'
+            f'<text x="{x:.1f}" y="{bar_area_h + 12}" text-anchor="middle" fill="#555" font-size="8">{t_lbl}</text>'
+        )
+
+    # Active range boundary markers
+    lo_x = ts_lo / 1000.0 * W
+    hi_x = ts_hi / 1000.0 * W
+    markers = (
+        f'<line x1="{lo_x:.1f}" y1="0" x2="{lo_x:.1f}" y2="{bar_area_h}" stroke="#ffffff18" stroke-width="0.8" stroke-dasharray="2,2"/>'
+        f'<line x1="{hi_x:.1f}" y1="0" x2="{hi_x:.1f}" y2="{bar_area_h}" stroke="#ffffff18" stroke-width="0.8" stroke-dasharray="2,2"/>'
+    )
+
+    svg = (
+        f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;display:block;">'
+        + markers + "".join(bars) + "".join(ticks)
+        + f'<line x1="0" y1="{bar_area_h}" x2="{W}" y2="{bar_area_h}" stroke="#333" stroke-width="0.5"/>'
+        + "</svg>"
+    )
+
+    # Human-readable parameter summary
+    param_desc = ""
+    if dist_type == "flow_shift":
+        _fs_p: dict = {}
+        for item in (dist_params or "").replace(",", " ").split():
+            if "=" in item:
+                k, v = item.split("=", 1)
+                try:
+                    _fs_p[k.strip()] = float(v.strip())
+                except ValueError:
+                    pass
+        param_desc = f" &nbsp;<span style='color:#666;'>shift={_fs_p.get('shift', 3.0):.3g}</span>"
+    elif dist_type == "logit_normal":
+        params: dict = {}
+        for item in (dist_params or "").replace(",", " ").split():
+            if "=" in item:
+                k, v = item.split("=", 1)
+                try:
+                    params[k.strip()] = float(v.strip())
+                except ValueError:
+                    pass
+        m, s = params.get("mean", 0.0), params.get("std", 1.0)
+        param_desc = f" &nbsp;<span style='color:#666;'>mean={m:.2g}&thinsp; std={s:.2g}</span>"
+    elif dist_type == "beta":
+        params2: dict = {}
+        for item in (dist_params or "").replace(",", " ").split():
+            if "=" in item:
+                k, v = item.split("=", 1)
+                try:
+                    params2[k.strip()] = float(v.strip())
+                except ValueError:
+                    pass
+        a2, b2 = params2.get("alpha", 0.5), params2.get("beta", 0.5)
+        param_desc = f" &nbsp;<span style='color:#666;'>α={a2:.2g}&thinsp; β={b2:.2g}</span>"
+
+    header = (
+        f'<div style="font-size:11px;margin-bottom:4px;font-family:sans-serif;">'
+        f'<span style="color:{color};font-weight:600;">{dist_type}</span>'
+        f'{param_desc}'
+        f'&nbsp;&nbsp;<span style="color:#555;font-size:10px;">range&thinsp;{ts_lo}–{ts_hi}</span>'
+        f'</div>'
+    )
+
+    return (
+        f'<div style="background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:8px 12px;">'
+        + header + svg + "</div>"
+    )
 
 
 def render_layer_preview(filter_str: str) -> str:
@@ -300,21 +551,94 @@ def on_ui_tabs():
                     col2_o1 = makeui(o_column2)
                 with gr.Column(variant="compact"):
                     col3_o1 = makeui(o_column3)
-                with gr.Column(variant="compact"):
-                    col4_o1 = makeui(o_column4)
+
+            # --- Timestep Distribution ---
+            gr.HTML(value="Timestep Distribution")
+            with gr.Row():
+                with gr.Column(variant="compact", scale=1):
+                    col_ts = makeui(o_ts_column)
+                with gr.Column(scale=2):
+                    with gr.Group(visible=True) as g_fs_sliders:
+                        fs_slider = gr.Slider(label="flow shift", minimum=0.05, maximum=5.0, step=0.05, value=3.0)
+                    with gr.Group(visible=False) as g_logit_sliders:
+                        mean_slider = gr.Slider(label="mean", minimum=-4.0, maximum=4.0,  step=0.1,  value=0.0)
+                        std_slider  = gr.Slider(label="std",  minimum=0.1,  maximum=4.0,  step=0.05, value=1.0)
+                    with gr.Group(visible=False) as g_beta_sliders:
+                        alpha_slider    = gr.Slider(label="alpha", minimum=0.1, maximum=20.0, step=0.1, value=0.5)
+                        beta_prm_slider = gr.Slider(label="beta",  minimum=0.1, maximum=20.0, step=0.1, value=0.5)
+                    ts_dist_preview = gr.HTML(
+                        value=render_timestep_distribution("flow_shift", 0, 1000, "shift=3.0"),
+                    )
+
+            # --- Layers ---
+            gr.HTML(value="Layers")
+            with gr.Row():
+                with gr.Column(variant="compact", scale=1):
+                    col_layer = makeui(o_layer_column)
+                with gr.Column(scale=2):
+                    layer_preview = gr.HTML(value=render_layer_preview(""))
 
             model_col_grs = [qwen3_gr, t5_gr]
-            all_gr = model_col_grs + col1_r1 + col2_r1 + col3_r1 + col1_o1 + col2_o1 + col3_o1 + col4_o1
+            all_gr = model_col_grs + col1_r1 + col2_r1 + col3_r1 + col1_o1 + col2_o1 + col3_o1 + col_ts + col_layer
             train_settings_1 = all_gr + [dummy]
 
-            # Layer browser: look up the filter widget by config-object identity —
-            # immune to reordering within all_gr.
-            _filter_gr = all_gr[trainer.all_configs.index(network_module_filter)]
-            with gr.Row():
-                layer_preview = gr.HTML(
-                    value=render_layer_preview(""),
-                    label="Layer browser",
+            # Look up config-tracked widgets by identity (immune to list reordering)
+            dist_gr      = all_gr[trainer.all_configs.index(train_timestep_distribution)]
+            ts_min_gr    = all_gr[trainer.all_configs.index(train_min_timesteps)]
+            ts_max_gr    = all_gr[trainer.all_configs.index(train_max_timesteps)]
+            ts_params_gr = all_gr[trainer.all_configs.index(train_ts_dist_params)]
+            _filter_gr   = all_gr[trainer.all_configs.index(network_module_filter)]
+
+            # Chart update: fired by any of the four config inputs
+            _ts_dist_inputs = [dist_gr, ts_min_gr, ts_max_gr, ts_params_gr]
+            for _inp in _ts_dist_inputs:
+                _inp.change(render_timestep_distribution, inputs=_ts_dist_inputs, outputs=[ts_dist_preview])
+
+            # When distribution type changes: reset params string + show correct slider group
+            _DIST_PARAM_DEFAULTS = {
+                "uniform":      "",
+                "flow_shift":   "shift=3.0",
+                "logit_normal": "mean=0.0 std=1.0",
+                "cosmap":       "",
+                "beta":         "alpha=0.5 beta=0.5",
+            }
+            def _on_dist_change(dist):
+                show_fs    = dist == "flow_shift"
+                show_logit = dist == "logit_normal"
+                show_beta  = dist == "beta"
+                return (
+                    _DIST_PARAM_DEFAULTS.get(dist, ""),  # reset dist_params text
+                    gr.update(visible=show_fs),
+                    gr.update(visible=show_logit),
+                    gr.update(visible=show_beta),
+                    gr.update(value=3.0),   # fs_slider
+                    gr.update(value=0.0),   # mean_slider
+                    gr.update(value=1.0),   # std_slider
+                    gr.update(value=0.5),   # alpha_slider
+                    gr.update(value=0.5),   # beta_prm_slider
                 )
+            dist_gr.change(
+                _on_dist_change, inputs=[dist_gr],
+                outputs=[ts_params_gr, g_fs_sliders, g_logit_sliders, g_beta_sliders,
+                         fs_slider, mean_slider, std_slider, alpha_slider, beta_prm_slider],
+            )
+
+            # flow_shift slider → dist_params (same pattern as logit_normal / beta)
+            fs_slider.change(lambda v: f"shift={v:.3g}", inputs=[fs_slider], outputs=[ts_params_gr])
+
+            # logit_normal sliders → dist_params
+            def _logit_to_params(mean, std):
+                return f"mean={mean:.2g} std={std:.2g}"
+            mean_slider.change(_logit_to_params, inputs=[mean_slider, std_slider], outputs=[ts_params_gr])
+            std_slider.change(_logit_to_params,  inputs=[mean_slider, std_slider], outputs=[ts_params_gr])
+
+            # beta sliders → dist_params
+            def _beta_to_params(alpha, beta_v):
+                return f"alpha={alpha:.3g} beta={beta_v:.3g}"
+            alpha_slider.change(_beta_to_params,    inputs=[alpha_slider, beta_prm_slider], outputs=[ts_params_gr])
+            beta_prm_slider.change(_beta_to_params, inputs=[alpha_slider, beta_prm_slider], outputs=[ts_params_gr])
+
+            # Layer preview
             _filter_gr.change(render_layer_preview, inputs=[_filter_gr], outputs=[layer_preview])
 
             with gr.Group(visible=False) as g_diff:

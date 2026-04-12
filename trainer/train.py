@@ -310,9 +310,10 @@ def train_lora(t):
                 ts_lo = max(0, ts_lo)
                 ts_hi = max(ts_lo + 1, min(1000, ts_hi))
 
-                flow_shift = getattr(t, 'train_flow_shift', 3.0)
+                dist_type  = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
+                dist_params = getattr(t, 'train_ts_dist_params', '') or ''
                 n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
-                timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, flow_shift, CUDA)
+                timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, CUDA, dist_type, dist_params)
                 timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
 
                 noisy_latents = t.noise_scheduler.add_noise(latents, noise, timesteps)
@@ -450,11 +451,12 @@ def train_diff2(t):
                 time_max = time_min + band_span
                 time_max = max(time_min + 1, min(time_max, ts_range_hi))
 
-            flow_shift = getattr(t, 'train_flow_shift', 3.0)
+            dist_type   = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
+            dist_params = getattr(t, 'train_ts_dist_params', '') or ''
             n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
             band_lo = int(min(time_min, ts_range_hi - 1))
             band_hi = int(max(time_max, ts_range_lo + 1))
-            timesteps = _sample_timesteps(band_lo, band_hi, n_ts, flow_shift, CUDA)
+            timesteps = _sample_timesteps(band_lo, band_hi, n_ts, CUDA, dist_type, dist_params)
             timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
 
             orig_noisy_latents = t.noise_scheduler.add_noise(
@@ -527,20 +529,66 @@ def flush():
     gc.collect()
 
 
-def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, flow_shift: float, device) -> torch.Tensor:
-    """Sample n integer timesteps in [ts_lo, ts_hi) with optional discrete flow shift.
+def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, device,
+                       dist_type: str = "flow_shift", dist_params: str = "") -> torch.Tensor:
+    """Sample n integer timesteps in [ts_lo, ts_hi) using the specified distribution.
 
-    flow_shift == 1.0  →  uniform (equivalent to torch.randint)
-    flow_shift  > 1.0  →  biased toward high-noise (high-t) end of the range,
-                          matching the sd-scripts discrete_flow_shift convention:
-                          sigma_shifted = (u * shift) / (1 + (shift - 1) * u)
+    dist_type:
+      "uniform"      — flat torch.randint
+      "flow_shift"   — bias toward high-noise via shift factor (sd-scripts convention)
+      "logit_normal" — sigmoid of Normal(mean, std); params: mean=0.0 std=1.0
+      "cosmap"       — cosine bijection; bias toward mid-noise
+      "beta"         — Beta(alpha, beta); params: alpha=0.5 beta=0.5
+                       alpha=beta=0.5 → inverse bell (U-shape), alpha=beta>1 → bell,
+                       alpha=beta=1 → uniform, alpha≠beta → skewed
     """
-    if flow_shift == 1.0:
+    import math as _math
+
+    span = ts_hi - ts_lo
+
+    # Parse "key=value ..." pairs shared by logit_normal and beta
+    params: dict = {}
+    for item in (dist_params or "").replace(",", " ").split():
+        if "=" in item:
+            k, v = item.split("=", 1)
+            try:
+                params[k.strip()] = float(v.strip())
+            except ValueError:
+                pass
+
+    if dist_type == "uniform":
+        return torch.randint(ts_lo, ts_hi, (n,), device=device)
+
+    if dist_type == "logit_normal":
+        mean = params.get("mean", 0.0)
+        std = max(0.01, params.get("std", 1.0))
+        u = torch.randn(n, device=device) * std + mean
+        sigma = torch.sigmoid(u)
+        return (sigma * span + ts_lo).long().clamp(ts_lo, ts_hi - 1)
+
+    if dist_type == "cosmap":
+        # sigma = 1 - 1 / (tan(pi/2 * u) + 1)  for u ~ Uniform(0, 1)
+        u = torch.rand(n, device=device).clamp(1e-6, 1.0 - 1e-6)
+        sigma = 1.0 - 1.0 / (torch.tan(u * (_math.pi / 2.0)) + 1.0)
+        return (sigma * span + ts_lo).long().clamp(ts_lo, ts_hi - 1)
+
+    if dist_type == "beta":
+        # Beta(alpha, beta): alpha=beta=0.5 → inverse bell, alpha=beta>1 → bell
+        alpha = max(0.01, params.get("alpha", 0.5))
+        beta  = max(0.01, params.get("beta",  0.5))
+        sigma = torch.distributions.Beta(
+            torch.tensor(alpha, dtype=torch.float32, device=device),
+            torch.tensor(beta,  dtype=torch.float32, device=device),
+        ).sample((n,))
+        return (sigma * span + ts_lo).long().clamp(ts_lo, ts_hi - 1)
+
+    # Default: "flow_shift" — shift parsed from dist_params
+    shift = max(0.0, params.get("shift", 3.0))
+    if shift <= 1.0:
         return torch.randint(ts_lo, ts_hi, (n,), device=device)
     u = torch.rand(n, device=device)
-    sigma = (u * flow_shift) / (1.0 + (flow_shift - 1.0) * u)
-    ts = (sigma * (ts_hi - ts_lo) + ts_lo).long().clamp(ts_lo, ts_hi - 1)
-    return ts
+    sigma = (u * shift) / (1.0 + (shift - 1.0) * u)
+    return (sigma * span + ts_lo).long().clamp(ts_lo, ts_hi - 1)
 
 
 # --------------------------------------------------------------------------- #

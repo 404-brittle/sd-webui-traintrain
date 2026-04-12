@@ -260,7 +260,7 @@ class LatentsConds(Dataset):
                 _TEXTURE_CANVAS_PRESETS = [
                     (640, 1536), (1536, 640),
                     (832, 1216), (1216, 832),
-                    (1024, 1024),
+                    (1024, 1024), (1024, 1024), #twice, for 1/3 chance.
                 ]
 
                 # Hybrid fullres mode: resize entire image to a canvas matching its
@@ -270,7 +270,15 @@ class LatentsConds(Dataset):
                     canvas_hw = min(_TEXTURE_CANVAS_PRESETS,
                                     key=lambda hw: abs(hw[1] / hw[0] - img_ar))
                     canvas_h, canvas_w = canvas_hw
-                    img_resized = image.resize((canvas_w, canvas_h), Image.LANCZOS)
+                    # Scale to cover the canvas (preserve AR), then center-crop the
+                    # overhang.  This cuts a tiny sliver of data rather than squashing.
+                    scale = max(canvas_w / image.width, canvas_h / image.height)
+                    scaled_w = round(image.width * scale)
+                    scaled_h = round(image.height * scale)
+                    img_resized = image.resize((scaled_w, scaled_h), Image.LANCZOS)
+                    left = (scaled_w - canvas_w) // 2
+                    top  = (scaled_h - canvas_h) // 2
+                    img_resized = img_resized.crop((left, top, left + canvas_w, top + canvas_h))
                     latent = self.t.image2latent(self.t, img_resized)
                     mask = None
                     cond1, cond2 = emb1, emb2

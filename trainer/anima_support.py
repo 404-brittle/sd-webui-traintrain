@@ -131,6 +131,76 @@ def anima_forward(t, noisy_latents: torch.Tensor, timesteps: torch.Tensor, conds
     return pred.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
 
 
+def anima_forward_refcn(
+    t,
+    noisy_latents: torch.Tensor,
+    ref_latents: torch.Tensor,
+    timesteps: torch.Tensor,
+    conds,
+) -> torch.Tensor:
+    """Anima DiT forward pass for Reference ControlNet training.
+
+    Concatenates the clean reference latent to the noisy target latent along
+    the temporal axis (making a 2-frame sequence), runs the model, then trims
+    the output back to the target frame only.  The sd-scripts Anima model does
+    not accept ref_latents natively — we replicate the Forge forward() logic.
+
+    Args:
+        t:             Trainer object.
+        noisy_latents: [B, C, H, W] — noisy target latent.
+        ref_latents:   [B, C, H, W] — clean reference/control latent (no noise).
+        timesteps:     [B] integer timesteps in [0, 999].
+        conds:         (prompt_embeds, qwen3_attn_mask, t5_ids or None, t5_mask or None)
+
+    Returns:
+        [B, C, H, W] velocity prediction for the target frames only.
+    """
+    import torch.nn.functional as F
+
+    if isinstance(conds, str):
+        conds, _ = t.text_model.encode_text([conds])
+        conds = move_cond_to_device(conds, noisy_latents.device, noisy_latents.dtype)
+    elif isinstance(conds, (tuple, list)) and conds and isinstance(conds[0], str):
+        conds, _ = t.text_model.encode_text(list(conds))
+        conds = move_cond_to_device(conds, noisy_latents.device, noisy_latents.dtype)
+
+    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = conds
+
+    if hasattr(t.unet, "preprocess_text_embeds"):
+        cross = t.unet.preprocess_text_embeds(prompt_embeds, t5_input_ids)
+    elif hasattr(t.unet, "llm_adapter") and t5_input_ids is not None:
+        cross = t.unet.llm_adapter(
+            prompt_embeds, t5_input_ids,
+            target_attention_mask=t5_attn_mask,
+            source_attention_mask=attn_mask,
+        )
+    else:
+        cross = prompt_embeds
+
+    if cross.shape[1] < 512:
+        cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
+
+    # [B, C, 1, H, W] — the sd-scripts Anima model's forward_mini_train_dit
+    # does not accept ref_latents.  We replicate the Forge forward() logic:
+    # concat reference along the temporal axis, run the model, then trim.
+    ref = ref_latents.to(dtype=noisy_latents.dtype, device=noisy_latents.device)
+    ref_5d   = ref.unsqueeze(2)                 # [B, C, 1, H, W]
+    tgt_5d   = noisy_latents.unsqueeze(2)       # [B, C, 1, H, W]
+    x_5d     = torch.cat([tgt_5d, ref_5d], dim=2)  # [B, C, 2, H, W]
+
+    timesteps_01 = timesteps.float() / 1000.0  # [B] in [0, 1]
+
+    B, _, H, W = noisy_latents.shape
+    # padding_mask is [B, 1, H, W] — prepare_embedded_sequence repeats it
+    # along the temporal axis internally, so we do NOT put T in here.
+    padding_mask = torch.zeros(B, 1, H, W, dtype=noisy_latents.dtype, device=noisy_latents.device)
+
+    # sd-scripts forward() passes **kwargs → forward_mini_train_dit; no ref_latents kwarg needed.
+    out = t.unet(x_5d, timesteps_01, cross, padding_mask=padding_mask)
+    # Trim output back to the target frame only: [B, C, 2, H, W] → [B, C, 1, H, W]
+    return out[:, :, :1, :, :].squeeze(2)  # [B, C, H, W]
+
+
 # ---------------------------------------------------------------------------
 # Text model wrapper
 # ---------------------------------------------------------------------------

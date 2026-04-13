@@ -18,6 +18,7 @@ from trainer.anima_support import (
     AnimaFlowScheduler,
     AnimaTextModel,
     anima_forward,
+    anima_forward_refcn,
     expand_cond,
     move_cond_to_device,
 )
@@ -38,6 +39,12 @@ except ImportError:
 
 MAX_DENOISING_STEPS = 1000
 ML = "LoRA"
+ML_REFCN = "RefCN"
+
+# How often (in steps) to compute the conditioning-influence diagnostic in RefCN mode.
+# Two extra forward passes (real ref + zero ref) are run with no_grad, so the cost
+# is small relative to a training step.
+REFCN_VAL_EVERY = 50
 
 jsonspath = trainer.jsonspath
 logspath = trainer.logspath
@@ -222,6 +229,8 @@ def train_main(jsononly, mode, modelname, vaename, *args):
     try:
         if t.mode == ML:
             result = train_lora(t)
+        elif t.mode == ML_REFCN:
+            result = train_refcn(t)
         elif t.mode == "ADDifT" or t.mode == "Multi-ADDifT":
             result = train_diff2(t)
         else:
@@ -297,21 +306,31 @@ def train_lora(t):
                 noise = torch.randn_like(latents)
                 batch_size = latents.shape[0]
 
-                # Resolve timestep range and optional LR override from schedule (or static config)
+                # Resolve timestep range, LR, and distribution from schedule (or static config)
                 step_pct = pbar.n / max(1, t.train_iterations - 1)
                 if _ts_schedule is not None:
                     _entry = _resolve_ts_entry(_ts_schedule, step_pct)
-                    ts_lo, ts_hi, _lr_override = _entry[1], _entry[2], _entry[4]
+                    _ts_lo_e, _ts_hi_e, _lr_override = _entry[1], _entry[2], _entry[4]
+                    # None means "not specified in this entry → inherit global"
+                    ts_lo = _ts_lo_e if _ts_lo_e is not None else t.train_min_timesteps
+                    ts_hi = _ts_hi_e if _ts_hi_e is not None else t.train_max_timesteps
                     if _lr_override is not None:
                         for pg in optimizer.param_groups:
                             pg['lr'] = _lr_override
+                    _sched_dist = _entry[5]   # dist_type override (None = inherit)
+                    if _sched_dist is not None:
+                        dist_type   = _sched_dist
+                        dist_params = (_entry[6] or '') if _entry[6] is not None else ''
+                    else:
+                        dist_type   = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
+                        dist_params = getattr(t, 'train_ts_dist_params', '') or ''
                 else:
-                    ts_lo, ts_hi = t.train_min_timesteps, t.train_max_timesteps
+                    ts_lo = t.train_min_timesteps
+                    ts_hi = t.train_max_timesteps
+                    dist_type   = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
+                    dist_params = getattr(t, 'train_ts_dist_params', '') or ''
                 ts_lo = max(0, ts_lo)
                 ts_hi = max(ts_lo + 1, min(1000, ts_hi))
-
-                dist_type  = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
-                dist_params = getattr(t, 'train_ts_dist_params', '') or ''
                 n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
                 timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, CUDA, dist_type, dist_params)
                 timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
@@ -363,6 +382,193 @@ def train_lora(t):
 
                 # Update hybrid mode for the NEXT batch fetch (1-step ahead)
                 _set_hybrid_mode(pbar.n / max(1, t.train_iterations - 1))
+
+                result = finisher(network, t, pbar.n)
+                if result is not None:
+                    return result
+
+            if pbar.n >= t.train_iterations:
+                break
+
+    return savecount(network, t, 0)
+
+
+def train_refcn(t):
+    """Reference ControlNet LoRA training loop.
+
+    Like train_lora but each batch includes a paired clean reference latent
+    that is passed to the Anima DiT via the ref_latents kwarg.  The model
+    learns to denoise the target conditioned on the reference, training the
+    LoRA modules to attend to the additional temporal context frame.
+
+    Dataset convention:
+      - Target images:    t.lora_data_directory  (same as LoRA)
+      - Reference images: t.refcn_ref_dir         (paired by filename stem)
+      - If refcn_ref_dir is empty: target image is its own reference (self-ref)
+    """
+    global stoptimer
+    stoptimer = 0
+
+    t.a.print("Preparing paired target / reference latents...")
+    dataloaders = dataset.make_dataloaders_refcn(t)
+    t.dataloader = dataset.ContinualRandomDataLoader(dataloaders)
+    t.dataloader = t.a.prepare(t.dataloader)
+
+    t.a.print("Train Anima Reference ControlNet LoRA Start")
+
+    network, optimizer, lr_scheduler = create_network(t)
+
+    if not t.dataloader.data:
+        return "No data!"
+
+    # All latents are pre-encoded in make_dataloaders_refcn — free VAE and
+    # text model so they don't occupy VRAM during the training loop.
+    del t.vae
+    if "BASE" not in t.network_blocks:
+        del t.text_model
+    flush()
+
+    _ts_schedule = _parse_ts_schedule_text(getattr(t, 'train_ts_schedule', '') or '')
+    if _ts_schedule:
+        print(f"Timestep schedule loaded: {len(_ts_schedule)} entries")
+
+    loss_ema = None
+    loss_velocity = None
+
+    # Conditioning-influence diagnostic state.
+    # Snapshotted from the first batch; reused every REFCN_VAL_EVERY steps.
+    _val_snap       = None   # (noisy_latents, ref_latents, timesteps, velocity_target, conds1)
+    _cond_influence = 0.0    # RMS shift caused by reference: ||pred_ref - pred_null|| / √numel
+    _cond_gain      = 0.0    # (loss_null - loss_ref) × 1000 — positive = ref helps
+
+    pbar = tqdm(range(t.train_iterations))
+    while t.train_iterations >= pbar.n:
+        for batch in t.dataloader:
+            for i in range(t.train_repeat):
+                latents     = batch["latent"].to(CUDA, dtype=t.train_lora_precision)
+                ref_latents = batch["ref_latent"].to(CUDA, dtype=t.train_lora_precision)
+                conds1      = batch["cond1"] if "cond1" in batch else None
+
+                noise      = torch.randn_like(latents)
+                batch_size = latents.shape[0]
+
+                # Timestep sampling
+                step_pct = pbar.n / max(1, t.train_iterations - 1)
+                if _ts_schedule is not None:
+                    _entry = _resolve_ts_entry(_ts_schedule, step_pct)
+                    ts_lo      = _entry[1] if _entry[1] is not None else t.train_min_timesteps
+                    ts_hi      = _entry[2] if _entry[2] is not None else t.train_max_timesteps
+                    _lr_override = _entry[4]
+                    if _lr_override is not None:
+                        for pg in optimizer.param_groups:
+                            pg['lr'] = _lr_override
+                    dist_type   = _entry[5] or getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
+                    dist_params = (_entry[6] or '') if _entry[6] is not None else getattr(t, 'train_ts_dist_params', '') or ''
+                else:
+                    ts_lo       = t.train_min_timesteps
+                    ts_hi       = t.train_max_timesteps
+                    dist_type   = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
+                    dist_params = getattr(t, 'train_ts_dist_params', '') or ''
+
+                ts_lo = max(0, ts_lo)
+                ts_hi = max(ts_lo + 1, min(1000, ts_hi))
+                n_ts  = 1 if t.train_fixed_timsteps_in_batch else batch_size
+                timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, CUDA, dist_type, dist_params)
+                timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
+
+                # Add noise to target only; reference stays clean
+                noisy_latents = t.noise_scheduler.add_noise(latents, noise, timesteps)
+
+                # Resolve text conditioning
+                if conds1 is None:
+                    conds1 = expand_cond(t.orig_cond, batch_size)
+                elif isinstance(conds1, str) or (isinstance(conds1, list) and isinstance(conds1[0], str)):
+                    conds1, _ = t.text_model.encode_text(conds1 if isinstance(conds1, list) else [conds1])
+                elif isinstance(conds1, (tuple, list)):
+                    conds1 = move_cond_to_device(conds1, CUDA, t.train_lora_precision)
+
+                with network, t.a.autocast():
+                    model_pred = anima_forward_refcn(t, noisy_latents, ref_latents, timesteps, conds1)
+
+                velocity_target = (noise - latents).to(torch.float32)
+
+                loss, loss_ema, loss_velocity = process_loss(
+                    t, model_pred, velocity_target, timesteps, loss_ema, loss_velocity,
+                )
+
+                t.a.backward(loss)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+                del model_pred
+                flush()
+
+                # ----------------------------------------------------------
+                # Snapshot the first batch for the conditioning-influence
+                # diagnostic.  Take only sample 0 (batch_size=1 slice) so the
+                # val forward passes are cheap regardless of training batch size.
+                # ----------------------------------------------------------
+                if _val_snap is None:
+                    _val_snap = (
+                        noisy_latents[:1].detach().clone(),
+                        ref_latents[:1].detach().clone(),
+                        timesteps[:1].detach().clone(),
+                        velocity_target[:1].detach().clone(),
+                        _clone_cond(conds1),
+                    )
+
+                # ----------------------------------------------------------
+                # Conditioning-influence diagnostic (every REFCN_VAL_EVERY steps).
+                #
+                # Runs two no-grad forward passes on the fixed val snapshot:
+                #   pred_ref:  model sees the real reference latent
+                #   pred_null: model sees an all-zero reference (no conditioning)
+                #
+                # _cond_influence: RMS shift = ||pred_ref - pred_null|| / √numel
+                #   • Near 0 at init (LoRA weights ≈ 0, reference has no effect)
+                #   • Should rise as the LoRA learns to use the reference
+                #
+                # _cond_gain: (loss_null − loss_ref) × 1000
+                #   • Positive  → reference actively improves denoising
+                #   • Near zero → reference changes predictions but doesn't help
+                #   • Negative  → reference is hurting (misconfiguration or overfit)
+                # ----------------------------------------------------------
+                if pbar.n > 0 and pbar.n % REFCN_VAL_EVERY == 0 and _val_snap is not None:
+                    _vn, _vr, _vts, _vtgt, _vcond = _val_snap
+                    _vn   = _vn.to(CUDA,  dtype=t.train_lora_precision)
+                    _vr   = _vr.to(CUDA,  dtype=t.train_lora_precision)
+                    _vts  = _vts.to(CUDA)
+                    _vtgt = _vtgt.to(CUDA, dtype=torch.float32)
+                    if isinstance(_vcond, (tuple, list)):
+                        _vcond_dev = move_cond_to_device(_vcond, CUDA, t.train_lora_precision)
+                    else:
+                        _vcond_dev = _vcond
+                    _zero_ref = torch.zeros_like(_vr)
+                    with torch.no_grad(), t.a.autocast(), network:
+                        _p_ref  = anima_forward_refcn(t, _vn, _vr,       _vts, _vcond_dev).float()
+                        _p_null = anima_forward_refcn(t, _vn, _zero_ref, _vts, _vcond_dev).float()
+                    _null_loss = F.mse_loss(_p_null, _vtgt).item()
+                    _ref_loss  = F.mse_loss(_p_ref,  _vtgt).item()
+                    _cond_influence = (_p_ref - _p_null).norm().item() / (_p_ref.numel() ** 0.5)
+                    _cond_gain      = (_null_loss - _ref_loss) * 1000
+                    del _p_ref, _p_null, _vn, _vr, _vts, _vtgt, _vcond_dev, _zero_ref
+                    flush()
+
+                c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
+                pbar.set_description(
+                    f"[RefCN] Loss: {loss_ema * 1000:.3f}"
+                    f" | Cond: {_cond_influence:.4f} ({_cond_gain:+.2f})"
+                    f" | LR: " + ", ".join(c_lrs) +
+                    f" | TS: {ts_lo}-{ts_hi} | Epoch: {t.dataloader.epoch}"
+                )
+                pbar.update(1)
+
+                if t.logging_save_csv:
+                    savecsv(t, pbar.n, loss_ema,
+                            [x.cpu().item() if isinstance(x, torch.Tensor) else x for x in lr_scheduler.get_last_lr()],
+                            t.csvpath,
+                            extra_cols={"Cond Influence": _cond_influence, "Cond Gain": _cond_gain})
 
                 result = finisher(network, t, pbar.n)
                 if result is not None:
@@ -524,9 +730,14 @@ def train_diff2(t):
 # Network / optimizer / scheduler helpers                                      #
 # --------------------------------------------------------------------------- #
 
+_flush_call_count = 0
+
 def flush():
+    global _flush_call_count
     torch.cuda.empty_cache()
-    gc.collect()
+    _flush_call_count += 1
+    if _flush_call_count % 20 == 0:
+        gc.collect()
 
 
 def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, device,
@@ -595,28 +806,146 @@ def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, device,
 # Timestep schedule                                                            #
 # --------------------------------------------------------------------------- #
 
+def _split_schedule_tokens(s: str) -> list:
+    """Split *s* on commas that are not inside parentheses."""
+    tokens, depth, cur = [], 0, []
+    for ch in s:
+        if ch == '(':
+            depth += 1; cur.append(ch)
+        elif ch == ')':
+            depth -= 1; cur.append(ch)
+        elif ch == ',' and depth == 0:
+            t = ''.join(cur).strip()
+            if t:
+                tokens.append(t)
+            cur = []
+        else:
+            cur.append(ch)
+    t = ''.join(cur).strip()
+    if t:
+        tokens.append(t)
+    return tokens
+
+
+def _parse_new_schedule_line(line: str):
+    """Parse a ``@<step_pct>[, key=value ...]`` schedule line.
+
+    Recognised keys
+    ---------------
+    range=<lo>-<hi>
+        Timestep window, e.g. ``range=50-450``.
+    ts_dist=<name>[(<params>)]
+        Distribution and its parameters, e.g.
+        ``ts_dist=flow_shift(shift=3.0)``  or  ``ts_dist=beta(alpha=0.14,beta=1.0)``.
+        Commas inside the parentheses are preserved and forwarded to *_sample_timesteps*.
+    mode=<texture|fullres|-|...>  **or bare word** ``texture`` / ``fullres``
+        Processing mode for hybrid training.
+    lr=<float>
+        Override learning rate for this phase, e.g. ``lr=1e-4``.
+
+    Returns a 7-tuple ``(step_pct, ts_lo, ts_hi, mode, lr_override, dist_type, dist_params)``
+    where any field can be *None* meaning "inherit the global setting".
+    Returns *None* on parse failure.
+    """
+    import re as _re
+    assert line.startswith('@'), line
+
+    tokens = _split_schedule_tokens(line[1:])  # strip '@', then split
+    if not tokens:
+        return None
+
+    try:
+        step_pct = float(tokens[0])
+    except ValueError:
+        return None
+
+    ts_lo = ts_hi = None
+    mode = ""
+    lr_override = None
+    dist_type = None
+    dist_params = None
+
+    _KNOWN_MODES = {"texture", "fullres"}
+
+    for token in tokens[1:]:
+        token = token.strip()
+        if not token:
+            continue
+
+        if '=' in token:
+            k, _, v = token.partition('=')
+            k = k.strip().lower()
+            v = v.strip()
+
+            if k == 'range':
+                parts = v.split('-', 1)
+                if len(parts) == 2:
+                    try:
+                        ts_lo, ts_hi = int(parts[0]), int(parts[1])
+                    except ValueError:
+                        pass
+
+            elif k == 'mode':
+                mode = v.lower()
+                if mode == '-':
+                    mode = ''
+
+            elif k == 'lr':
+                try:
+                    lr_override = float(v)
+                except ValueError:
+                    pass
+
+            elif k == 'ts_dist':
+                # v is e.g. "flow_shift(shift=3.0)" or "uniform" or "beta(alpha=0.14,beta=1.0)"
+                m = _re.match(r'^(\w+)(?:\((.+)\))?$', v, _re.DOTALL)
+                if m:
+                    dist_type = m.group(1).lower()
+                    raw_p = (m.group(2) or '').strip()
+                    # _sample_timesteps expects space- or comma-separated "key=value" pairs
+                    dist_params = raw_p  # commas inside parens are fine; parser splits on '='
+
+        else:
+            # bare word
+            if token.lower() in _KNOWN_MODES:
+                mode = token.lower()
+
+    return (step_pct, ts_lo, ts_hi, mode, lr_override, dist_type, dist_params)
+
+
 def _parse_ts_schedule_text(text: str):
     """Parse a timestep schedule from inline text (stored directly in the config).
 
-    Format — one entry per non-comment line::
+    Two syntaxes are supported and may be mixed freely.
+
+    **Keyword syntax (preferred)**::
+
+        # @<step_pct>, [key=value | bare_mode] ...
+        #
+        # step_pct  0.0–1.0 fraction of total training steps at which row activates
+        # range     lo-hi window, e.g. range=50-450
+        # ts_dist   distribution + params, e.g. ts_dist=flow_shift(shift=3.0)
+        #                                   or  ts_dist=beta(alpha=0.14,beta=1.0)
+        # mode      texture | fullres | -     (bare word or mode=...)
+        # lr        learning-rate override, e.g. lr=1e-4
+        #
+        # Unspecified fields inherit global config values.
+        #
+        @0,    range=200-800, ts_dist=flow_shift(shift=3.0), fullres, lr=1e-4
+        @0.4,  range=0-700,   ts_dist=beta(alpha=0.14,beta=1.0), mode=texture
+        @0.7,  range=0-1000,  ts_dist=uniform, mode=texture
+
+    **Positional syntax (legacy)**::
 
         # Columns: step_pct   t_min   t_max   [mode]   [lr]
-        #
-        # step_pct  0.0–1.0, fraction of total training steps at which row activates
-        # mode      texture | fullres | - (- or blank = keep current mode)
-        # lr        effective learning rate for this phase (e.g. 1e-4); omit to keep scheduler value
-        #
-        # Weighting is always flat (uniform).
-        # Step-function: the LAST row whose step_pct ≤ current fraction is active.
-        # Example — curriculum that widens range, switches mode, and adjusts LR:
-        #
-        # 0.00   200   800   fullres   1e-4
-        # 0.40     0   700   texture   5e-5
-        # 0.70     0  1000   texture
+        0.00   200   800   fullres   1e-4
+        0.40     0   700   texture   5e-5
+        0.70     0  1000   texture
 
-    Returns a sorted list of (step_pct, ts_lo, ts_hi, mode, lr_override) tuples,
-    or None if text is empty / contains no valid entries.
-    lr_override is a float or None if not specified.
+    Returns a sorted list of 7-tuples
+    ``(step_pct, ts_lo, ts_hi, mode, lr_override, dist_type, dist_params)``
+    where *dist_type* / *dist_params* are *None* when not specified (inherit global).
+    Returns *None* if *text* is empty / contains no valid entries.
     """
     entries = []
     for raw in (text or "").splitlines():
@@ -625,6 +954,14 @@ def _parse_ts_schedule_text(text: str):
             continue
         if line.startswith("[") and line.endswith("]"):
             continue  # ignore legacy section headers gracefully
+
+        if line.startswith("@"):
+            entry = _parse_new_schedule_line(line)
+            if entry is not None:
+                entries.append(entry)
+            continue
+
+        # --- Legacy positional format ---
         parts = line.split()
         if len(parts) < 3:
             continue
@@ -639,6 +976,8 @@ def _parse_ts_schedule_text(text: str):
                 int(parts[2]),
                 mode,
                 lr_override,
+                None,   # dist_type  → inherit global
+                None,   # dist_params → inherit global
             )
         except (ValueError, IndexError):
             continue
@@ -647,7 +986,7 @@ def _parse_ts_schedule_text(text: str):
     if not entries:
         return None
     entries.sort(key=lambda e: e[0])
-    return entries   # list of (step_pct, ts_lo, ts_hi, mode, lr_override)
+    return entries   # list of (step_pct, ts_lo, ts_hi, mode, lr_override, dist_type, dist_params)
 
 
 def _resolve_ts_entry(entries: list, step_pct: float):
@@ -822,11 +1161,28 @@ CSVHEADS = ["network_rank", "network_alpha", "train_learning_rate", "train_itera
             "train_lr_scheduler", "model_version", "train_optimizer", "save_lora_name"]
 
 
-def savecsv(t, step, loss, lr, csvpath, copy=False):
+def _clone_cond(cond):
+    """Clone a conditioning tuple/tensor to CPU so it can be stored as a val snapshot."""
+    if isinstance(cond, str):
+        return cond
+    if isinstance(cond, (tuple, list)):
+        return tuple(c.detach().cpu().clone() if isinstance(c, torch.Tensor) else c for c in cond)
+    if isinstance(cond, torch.Tensor):
+        return cond.detach().cpu().clone()
+    return cond
+
+
+def savecsv(t, step, loss, lr, csvpath, copy=False, extra_cols=None):
+    """Append one row to a training CSV log.
+
+    extra_cols: optional dict {column_name: value} appended after the LR columns.
+                Written into the header the first time the file is created.
+    """
     header = []
     for key in CSVHEADS:
         header.append([key, getattr(t, key, "")])
-    header.append(["Step", "Loss"] + ["Learning Rate " + str(i + 1) for i in range(len(lr))])
+    extra_names = list(extra_cols.keys()) if extra_cols else []
+    header.append(["Step", "Loss"] + ["Learning Rate " + str(i + 1) for i in range(len(lr))] + extra_names)
 
     if copy:
         csvpath = csvpath.replace(".csv", "_copy.csv")
@@ -841,7 +1197,8 @@ def savecsv(t, step, loss, lr, csvpath, copy=False):
         if not file_exists:
             for head in header:
                 writer.writerow(head)
-        writer.writerow([step, loss] + lr)
+        extra_vals = list(extra_cols.values()) if extra_cols else []
+        writer.writerow([step, loss] + lr + extra_vals)
 
 
 def metadator(t):

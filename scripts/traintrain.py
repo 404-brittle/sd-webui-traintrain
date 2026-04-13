@@ -13,7 +13,7 @@ logspath = trainer.logspath
 presetspath = trainer.presetspath
 
 # Anima-only modes
-MODES = ["LoRA", "ADDifT", "Multi-ADDifT"]
+MODES = ["LoRA", "ADDifT", "Multi-ADDifT", "RefCN"]
 
 # Anima DiT block IDs: BASE (text encoder / global) + B00-B27 (28 transformer blocks)
 from trainer.lora import generate_anima_preview_keys, _matches_module_filter
@@ -38,20 +38,22 @@ SCHEDULERS = ["linear", "cosine_annealing", "cosine_annealing_with_restarts", "l
               "reduce_on_plateau", "cyclic", "one_cycle"]
 ATTN_MODES = ["torch", "flash", "xformers"]
 
-# --- Visibility flags: 3 entries — [LoRA, ADDifT, Multi-ADDifT] ---
-ALL       = [True,  True,  True ]
-LORA      = [True,  False, False]
-ADIFT     = [False, True,  False]
-MDIFF     = [False, False, True ]
-LORA_MDIFF = [True, False, True ]
-DIFF      = [False, True,  True ]   # ADDifT + Multi-ADDifT
-NDIFF2    = [True,  True,  True ]   # same as ALL, kept for clarity
-ALLN      = [False, False, False]
+# --- Visibility flags: 4 entries — [LoRA, ADDifT, Multi-ADDifT, RefCN] ---
+ALL        = [True,  True,  True,  True ]
+LORA       = [True,  False, False, False]
+ADIFT      = [False, True,  False, False]
+MDIFF      = [False, False, True,  False]
+LORA_MDIFF = [True,  False, True,  True ]   # data dir shared by LoRA, Multi-ADDifT, RefCN
+DIFF       = [False, True,  True,  False]   # ADDifT + Multi-ADDifT
+NDIFF2     = [True,  True,  True,  True ]   # same as ALL, kept for clarity
+ALLN       = [False, False, False, False]
+REFCN      = [False, False, False, True ]   # RefCN-only fields
 
 # Required parameters
 lora_data_directory    = ["lora_data_directory",   "TX", None,              "",      str,   LORA_MDIFF]
 lora_trigger_word      = ["lora_trigger_word",      "TX", None,              "",      str,   LORA_MDIFF]
 diff_target_name       = ["diff_target_name",       "TX", None,              "",      str,   MDIFF]
+refcn_ref_dir          = ["refcn_ref_dir",          "TX", None,              "",      str,   REFCN]
 network_rank           = ["network_rank",            "DD", NETWORK_DIMS[2:],  "16",    int,   ALL]
 network_alpha          = ["network_alpha",           "DD", NETWORK_ALPHAS,    "8",     float, ALL]
 image_size             = ["image_size(height, width)","TX", None,             512,     str,   ALL]
@@ -106,9 +108,19 @@ TIMESTEP_DISTRIBUTIONS = ["uniform", "flow_shift", "logit_normal", "cosmap", "be
 train_timestep_distribution = ["train_timestep_distribution", "DD", TIMESTEP_DISTRIBUTIONS, "flow_shift", str, ALL]
 train_ts_dist_params = ["train_ts_dist_params(e.g. mean=0.0 std=1.0)", "TX", None, "", str, ALL]
 # Inline timestep curriculum schedule.  When non-empty, overrides train_min/max_timesteps.
-# Format: one entry per line — step_pct  t_min  t_max  [weight_fn]  [mode]
-# weight_fn: flat | gaussian:center:sigma | linear:lo_w:hi_w
-# mode: texture | fullres (only used when train_hybrid_mode is enabled)
+#
+# Keyword syntax (preferred) — @<step_pct>, key=value ...
+#   range=lo-hi        timestep window, e.g. range=50-450
+#   ts_dist=name(...)  distribution + params, e.g. ts_dist=flow_shift(shift=3.0)
+#                                              or   ts_dist=beta(alpha=0.14,beta=1.0)
+#   mode=texture|fullres|-   or bare word texture/fullres
+#   lr=1e-4            learning-rate override for this phase
+#   Unspecified fields inherit global config values.
+#
+# Legacy positional syntax — step_pct  t_min  t_max  [mode]  [lr]
+#   0.00  200  800  fullres  1e-4
+#
+# Both syntaxes may be mixed in the same schedule.
 train_ts_schedule   = ["train_ts_schedule",   "ML", None, "",   str,   ALL]
 # Hybrid mode: use the same dataset as both texture patches (detail steps) and
 # full-res images (layout steps), switching automatically based on the schedule mode column.
@@ -123,7 +135,7 @@ network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", 
 LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]
 network_llrd_decay = ["network_llrd_decay", "DD", LLRD_DECAYS, "1.0", float, ALL]
 
-r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
+r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, refcn_ref_dir, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
 r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, train_lr_scheduler_settings, save_lora_name, use_gradient_checkpointing]
 

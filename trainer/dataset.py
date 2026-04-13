@@ -419,6 +419,226 @@ class LatentsConds(Dataset):
 
 TARGET_IMAGEFILES = ["jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp", "webp", "pcx", "ico"]
 
+
+# ---------------------------------------------------------------------------
+# Reference ControlNet dataset
+# ---------------------------------------------------------------------------
+
+class LatentsCondsRefCN(Dataset):
+    """Dataset for Reference ControlNet training.
+
+    Each item is a (target_latent, ref_latent, cond) triple.  The target
+    latent will be noised during training; the reference latent is passed
+    clean to the model via ref_latents kwarg.
+    """
+
+    def __init__(self, t, items):
+        """
+        Args:
+            t:     Trainer object.
+            items: list of [target_latent, ref_latent, cond1, cond2]
+                   where latents are [1, C, H, W] CPU tensors.
+        """
+        self.items = items
+        if t.train_batch_size > len(self.items):
+            self.items = self.items * t.train_batch_size
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        tgt_lat, ref_lat, cond1, cond2 = self.items[i]
+        batch = {
+            "latent":     tgt_lat.squeeze().cpu(),
+            "ref_latent": ref_lat.squeeze().cpu(),
+        }
+        if cond1 is not None:
+            batch["cond1"] = cond1 if isinstance(cond1, (str, tuple, list)) else cond1.squeeze().cpu()
+        return batch
+
+
+def _build_ref_index(ref_dir: str) -> dict:
+    """Return {stem_lower: absolute_path} for every image in ref_dir."""
+    index = {}
+    if not ref_dir or not os.path.isdir(ref_dir):
+        return index
+    for root, _, files in os.walk(ref_dir):
+        for fname in files:
+            if any(fname.lower().endswith(ext) for ext in TARGET_IMAGEFILES):
+                stem = os.path.splitext(fname)[0].lower()
+                index[stem] = os.path.join(root, fname)
+    return index
+
+
+_VAE_ENCODE_BATCH = 8   # images per VAE forward pass; increase if VRAM allows
+
+
+def _pils_to_latents(t, pils, batch_size=_VAE_ENCODE_BATCH):
+    """Batch-encode a list of same-size PIL images to CPU latent tensors.
+
+    Returns a list of [1, C, H', W'] CPU tensors, one per input image.
+    """
+    import numpy as _np
+    latents = []
+    for start in range(0, len(pils), batch_size):
+        chunk = pils[start:start + batch_size]
+        tensors = [
+            torch.from_numpy(_np.array(img.convert("RGB")).astype(_np.float32) / 255.0)
+                 .permute(2, 0, 1)                              # [C, H, W]
+            for img in chunk
+        ]
+        batch = (torch.stack(tensors) * 2.0 - 1.0).to(next(t.vae.parameters()).device, dtype=t.train_model_precision)
+        lats = t.vae.encode_pixels_to_latents(batch)           # [B, C, H', W']
+        latents.extend(lats.cpu().split(1, dim=0))             # list of [1, C, H', W']
+    return latents
+
+
+def _split_cond_at(cond, i):
+    """Slice sample i from a batched encode_text result (keeps batch dim = 1)."""
+    prompt_embeds, qwen3_mask, t5_ids, t5_mask = cond
+    return (
+        prompt_embeds[i:i + 1],
+        qwen3_mask[i:i + 1],
+        t5_ids[i:i + 1]  if t5_ids  is not None else None,
+        t5_mask[i:i + 1] if t5_mask is not None else None,
+    )
+
+
+def make_dataloaders_refcn(t):
+    """Build DataLoaders for Reference ControlNet training.
+
+    Target images come from t.lora_data_directory (same convention as LoRA).
+    Reference images come from t.refcn_ref_dir (matched by filename stem).
+    If t.refcn_ref_dir is empty, the target image is used as its own reference
+    (self-reference mode — useful for learning the injection mechanism).
+
+    Both target and reference images are batch-encoded with the VAE (up to
+    _VAE_ENCODE_BATCH at a time) and stored as CPU tensors.  Text conditioning
+    is also batch-encoded per bucket so all embeddings share uniform padding,
+    which avoids DataLoader collation errors with mixed-length captions.
+    """
+    ref_index = _build_ref_index(getattr(t, "refcn_ref_dir", "") or "")
+    self_ref = not ref_index
+    if self_ref:
+        print("[RefCN] No reference directory set — using self-reference (target = reference).")
+    else:
+        print(f"[RefCN] Reference index built: {len(ref_index)} images from '{t.refcn_ref_dir}'")
+
+    # RefCN needs pre-encoded latents (7-element entries), not JIT texture entries
+    # (8-element). Temporarily disable texture_mode and train_hybrid_mode so that
+    # load_resize_image_and_text eagerly encodes all images to latents.
+    _saved_texture = getattr(t, "texture_mode", False)
+    _saved_hybrid  = getattr(t, "train_hybrid_mode", False)
+    t.texture_mode = False
+    t.train_hybrid_mode = False
+
+    find_filesets(t)
+    make_buckets(t)
+    load_resize_image_and_text(t)
+
+    t.texture_mode = _saved_texture
+    t.train_hybrid_mode = _saved_hybrid
+
+    # ------------------------------------------------------------------
+    # Phase 1 (CPU): collect (tgt_pil, ref_pil, prompt) per bucket.
+    # Reference images are loaded from disk here — one pass, no I/O in
+    # the encoding loop below.
+    # ------------------------------------------------------------------
+    raw_by_bucket = {}   # bucket_key -> [(tgt_pil, ref_pil, prompt), ...]
+    skipped = 0
+
+    for key in t.image_buckets_raw:
+        bucket_w, bucket_h = key
+        for entry in t.image_buckets_raw[key]:
+            if len(entry) == 8 and entry[7]:   # texture-mode guard (should not appear)
+                continue
+
+            image, mask, text, caption, filename, img_path, _targ_path = entry[:7]
+            stem = os.path.splitext(os.path.basename(img_path))[0].lower()
+
+            if self_ref:
+                ref_pil = image
+            elif stem in ref_index:
+                ref_pil = Image.open(ref_index[stem]).convert("RGB")
+                if ref_pil.size != (bucket_w, bucket_h):
+                    ref_pil = ref_pil.resize((bucket_w, bucket_h), Image.LANCZOS)
+            else:
+                skipped += 1
+                continue
+
+            if t.image_use_filename_as_tag:
+                prompt = t.lora_trigger_word + "," + filename
+            elif text is not None:
+                prompt = t.lora_trigger_word + ", " + text
+            elif caption is not None:
+                prompt = t.lora_trigger_word + ", " + caption
+            else:
+                prompt = t.lora_trigger_word
+
+            raw_by_bucket.setdefault(key, []).append((image, ref_pil, prompt))
+
+    # ------------------------------------------------------------------
+    # Phase 2 (GPU): batch-encode VAE + text per bucket.
+    # VAE: all images in a bucket share the same spatial size, so we can
+    #      stack them into a single [B, C, H, W] call.
+    # Text: encoding the whole bucket together pads to a uniform seq_len,
+    #       preventing DataLoader collation errors with mixed captions.
+    # ------------------------------------------------------------------
+    items_per_bucket = {}
+    paired = 0
+    total  = sum(len(v) for v in raw_by_bucket.values())
+
+    with torch.no_grad(), t.a.autocast():
+        bar = tqdm(total=total, desc="[RefCN] Encoding latents")
+        for key, samples in raw_by_bucket.items():
+            tgt_pils = [s[0] for s in samples]
+            ref_pils = [s[1] for s in samples]
+            prompts  = [s[2] for s in samples]
+
+            # VAE encode targets (batched)
+            tgt_lats = _pils_to_latents(t, tgt_pils)           # list of [1, C, H', W']
+
+            # VAE encode references — skip for self-ref (share target latents)
+            if self_ref:
+                ref_lats = tgt_lats
+            else:
+                ref_lats = _pils_to_latents(t, ref_pils)
+
+            # Text encode — batch the whole bucket so padding is uniform.
+            # Deduplicate to avoid redundant forward passes.
+            if "BASE" not in t.network_blocks:
+                unique_prompts  = list(dict.fromkeys(prompts))
+                batched_cond, _ = t.text_model.encode_text(unique_prompts)
+                idx_map         = {p: i for i, p in enumerate(unique_prompts)}
+                emb_list        = [
+                    _squeeze_cond(_split_cond_at(batched_cond, idx_map[p]))
+                    for p in prompts
+                ]
+            else:
+                emb_list = list(prompts)   # raw-string pass-through for BASE mode
+
+            bucket_items = [
+                [tgt_lat, ref_lat, emb, None]
+                for tgt_lat, ref_lat, emb in zip(tgt_lats, ref_lats, emb_list)
+            ]
+            items_per_bucket[key] = bucket_items
+            paired += len(bucket_items)
+            bar.update(len(samples))
+        bar.close()
+
+    if skipped:
+        print(f"[RefCN] Skipped {skipped} images (no matching reference).")
+    print(f"[RefCN] Dataset: {paired} paired samples across {len(items_per_bucket)} bucket(s).")
+
+    dataloaders = []
+    for key, items in items_per_bucket.items():
+        ds = LatentsCondsRefCN(t, items)
+        if len(ds) > 0:
+            dataloaders.append(DataLoader(ds, batch_size=t.train_batch_size, shuffle=True))
+
+    return dataloaders
+
+
 def make_buckets(t):
     increment = t.image_buckets_step # default : 256
     # 最大ピクセル数 resolutionは[x ,y]の配列。 y >= x

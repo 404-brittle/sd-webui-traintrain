@@ -54,6 +54,7 @@ lora_data_directory    = ["lora_data_directory",   "TX", None,              "", 
 lora_trigger_word      = ["lora_trigger_word",      "TX", None,              "",      str,   LORA_MDIFF]
 diff_target_name       = ["diff_target_name",       "TX", None,              "",      str,   MDIFF]
 refcn_ref_dir          = ["refcn_ref_dir",          "TX", None,              "",      str,   REFCN]
+refcn_zero_mean_ref    = ["refcn_zero_mean_ref",    "CH", None,              False,   bool,  REFCN]
 network_rank           = ["network_rank",            "DD", NETWORK_DIMS[2:],  "16",    int,   ALL]
 network_alpha          = ["network_alpha",           "DD", NETWORK_ALPHAS,    "8",     float, ALL]
 image_size             = ["image_size(height, width)","TX", None,             512,     str,   ALL]
@@ -135,7 +136,7 @@ network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", 
 LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]
 network_llrd_decay = ["network_llrd_decay", "DD", LLRD_DECAYS, "1.0", float, ALL]
 
-r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, refcn_ref_dir, lora_trigger_word]
+r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, refcn_ref_dir, refcn_zero_mean_ref, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
 r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, train_lr_scheduler_settings, save_lora_name, use_gradient_checkpointing]
 

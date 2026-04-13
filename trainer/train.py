@@ -1223,4 +1223,5 @@ def metadator(t):
         "ss_optimizer": t.train_optimizer,
         "ss_min_snr_gamma": 0,
         "ss_tag_frequency": json.dumps({1: t.count_dict}),
+        "refcn_zero_mean_ref": getattr(t, "refcn_zero_mean_ref", False),
     }

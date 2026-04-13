@@ -184,6 +184,8 @@ def anima_forward_refcn(
     # does not accept ref_latents.  We replicate the Forge forward() logic:
     # concat reference along the temporal axis, run the model, then trim.
     ref = ref_latents.to(dtype=noisy_latents.dtype, device=noisy_latents.device)
+    if getattr(t, "refcn_zero_mean_ref", False):
+        ref = ref - ref.mean(dim=(-2, -1), keepdim=True)
     ref_5d   = ref.unsqueeze(2)                 # [B, C, 1, H, W]
     tgt_5d   = noisy_latents.unsqueeze(2)       # [B, C, 1, H, W]
     x_5d     = torch.cat([tgt_5d, ref_5d], dim=2)  # [B, C, 2, H, W]

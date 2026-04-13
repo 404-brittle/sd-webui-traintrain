@@ -505,13 +505,16 @@ def load_lr_scheduler(t, optimizer):
             **args
         )
     
+    # Pop keys that are also explicit kwargs so they can be overridden via the
+    # settings field without causing "got multiple values for keyword argument".
+    _sched_args = dict(t.train_lr_scheduler_settings)
     return get_scheduler(
         name=t.train_lr_scheduler,
         optimizer=optimizer,
         step_rules="",
-        num_warmup_steps=0,
+        num_warmup_steps=_sched_args.pop("num_warmup_steps", 0),
         num_training_steps=t.train_iterations,
-        num_cycles=1,
+        num_cycles=_sched_args.pop("num_cycles", 1),
         power=t.train_lr_scheduler_power if t.train_lr_scheduler_power > 0 else 1.0,
-        **t.train_lr_scheduler_settings
+        **_sched_args
     )

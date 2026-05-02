@@ -290,8 +290,11 @@ def train_lora(t):
 
         # Pre-fill queues with real data so the covariance estimate is
         # non-degenerate from step 1 (avoids eigendecomposition failures).
+        # In texture mode, pass mask_key="mask" so only the crop region is
+        # enqueued — the frequency-matched noise background is excluded.
+        _pf_mask_key = "mask" if getattr(t, 'texture_mode', False) else None
         t.a.print("  Pre-filling FD-Loss queues with training data...")
-        fd_manager.prefill_from_dataloader(t.dataloader, t.vae)
+        fd_manager.prefill_from_dataloader(t.dataloader, t.vae, mask_key=_pf_mask_key)
         t.a.print("  FD-Loss queues pre-filled.")
     # -------------------------------------------------------------------------
 
@@ -392,15 +395,57 @@ def train_lora(t):
                     # Decode predicted clean latents to pixels [0, 1]
                     pred_pixels = latent2pixels(t, pred_clean)
 
-                    # Compute FD-Loss (gradient-preserving)
-                    fd_loss, fd_dict = fd_manager.compute_loss(pred_pixels)
+                    # In texture mode, the batch contains a full canvas with frequency-matched
+                    # noise background + a placed crop.  We must feed ONLY the crop region to
+                    # FD-Loss — the background noise would pollute the feature queue and make
+                    # the FID comparison meaningless (comparing noise distributions vs real data).
+                    # The mask (latent-space, [B, H_lat, W_lat]) is non-zero only on the crop.
+                    if train_mask is not None:
+                        # Vectorised per-sample bounding box from latent-space mask.
+                        # mask_t: [B, H_lat, W_lat], pred_pixels: [B, 3, H_px, W_px]
+                        mask_t = train_mask.unsqueeze(1).float()  # [B, 1, H_lat, W_lat] for interpolation
+                        mask_px = F.interpolate(
+                            mask_t,
+                            size=pred_pixels.shape[-2:],
+                            mode='nearest',
+                        )  # [B, 1, H_px, W_px]
+                        m = mask_px[:, 0]  # [B, H_px, W_px]
+                        B = m.shape[0]
+                        rows_any = (m > 0.5).any(dim=2)  # [B, H_px]
+                        cols_any = (m > 0.5).any(dim=1)  # [B, W_px]
+                        # Cumsum trick: first/last nonzero index per sample
+                        rows_cs = rows_any.cumsum(dim=1)
+                        rows_cs_rev = rows_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+                        cols_cs = cols_any.cumsum(dim=1)
+                        cols_cs_rev = cols_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+                        has_mask = rows_any.any(dim=1) & cols_any.any(dim=1)
+                        y1 = ((rows_cs == 1) & rows_any).int().argmax(dim=1)
+                        y2 = ((rows_cs_rev == 1) & rows_any).int().argmax(dim=1) + 1
+                        x1 = ((cols_cs == 1) & cols_any).int().argmax(dim=1)
+                        x2 = ((cols_cs_rev == 1) & cols_any).int().argmax(dim=1) + 1
+                        no_mask = ~has_mask
+                        if no_mask.any():
+                            y1[no_mask] = 0
+                            y2[no_mask] = pred_pixels.shape[2]
+                            x1[no_mask] = 0
+                            x2[no_mask] = pred_pixels.shape[3]
+                        fd_pixels = torch.stack([
+                            pred_pixels[b, :, y1[b]:y2[b], x1[b]:x2[b]]
+                            for b in range(B)
+                        ], dim=0)
+                    else:
+                        # Full-res mode: use the whole image as-is
+                        fd_pixels = pred_pixels
+
+                    # Compute FD-Loss (gradient-preserving) on crop-only pixels
+                    fd_loss, fd_dict = fd_manager.compute_loss(fd_pixels)
 
                     # Add FD-Loss to total loss (weighted)
                     fd_weight = getattr(t, 'fd_loss_weight', 0.1)
                     loss = loss + fd_weight * fd_loss
 
-                    # Enqueue features for next step (detached, no grad)
-                    fd_manager.enqueue_features(pred_pixels)
+                    # Enqueue features for next step (detached, no grad) — crop-only
+                    fd_manager.enqueue_features(fd_pixels)
 
                     # Log FID values
                     _fd_str = ", ".join([f"{k}={v:.2f}" for k, v in fd_dict.items()])
@@ -491,8 +536,11 @@ def train_diff2(t):
 
         # Pre-fill queues with real data so the covariance estimate is
         # non-degenerate from step 1 (avoids eigendecomposition failures).
+        # In texture mode, pass mask_key="mask" so only the crop region is
+        # enqueued — the frequency-matched noise background is excluded.
+        _pf_mask_key = "mask" if getattr(t, 'texture_mode', False) else None
         t.a.print("  Pre-filling FD-Loss queues with training data...")
-        fd_manager.prefill_from_dataloader(t.dataloader, t.vae)
+        fd_manager.prefill_from_dataloader(t.dataloader, t.vae, mask_key=_pf_mask_key)
         t.a.print("  FD-Loss queues pre-filled.")
     # -------------------------------------------------------------------------
 
@@ -604,15 +652,52 @@ def train_diff2(t):
                 # Decode predicted clean latents to pixels [0, 1]
                 pred_pixels = latent2pixels(t, pred_clean)
 
-                # Compute FD-Loss (gradient-preserving)
-                fd_loss, fd_dict = fd_manager.compute_loss(pred_pixels)
+                # In texture mode, the batch contains a full canvas with frequency-matched
+                # noise background + a placed crop.  Feed ONLY the crop region to FD-Loss.
+                # The mask (latent-space, [B, H_lat, W_lat]) is non-zero only on the crop.
+                # Vectorised per-sample bounding box via cumsum trick (no Python loop).
+                if "mask" in batch and batch["mask"] is not None:
+                    mask_t = batch["mask"].to(CUDA)  # [B, H_lat, W_lat]
+                    mask_px = F.interpolate(
+                        mask_t.unsqueeze(1).float(),  # [B, 1, H_lat, W_lat]
+                        size=pred_pixels.shape[-2:],
+                        mode='nearest',
+                    )  # [B, 1, H_px, W_px]
+                    m = mask_px[:, 0]  # [B, H_px, W_px]
+                    B = m.shape[0]
+                    rows_any = (m > 0.5).any(dim=2)  # [B, H_px]
+                    cols_any = (m > 0.5).any(dim=1)  # [B, W_px]
+                    rows_cs = rows_any.cumsum(dim=1)
+                    rows_cs_rev = rows_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+                    cols_cs = cols_any.cumsum(dim=1)
+                    cols_cs_rev = cols_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+                    has_mask = rows_any.any(dim=1) & cols_any.any(dim=1)
+                    y1 = ((rows_cs == 1) & rows_any).int().argmax(dim=1)
+                    y2 = ((rows_cs_rev == 1) & rows_any).int().argmax(dim=1) + 1
+                    x1 = ((cols_cs == 1) & cols_any).int().argmax(dim=1)
+                    x2 = ((cols_cs_rev == 1) & cols_any).int().argmax(dim=1) + 1
+                    no_mask = ~has_mask
+                    if no_mask.any():
+                        y1[no_mask] = 0
+                        y2[no_mask] = pred_pixels.shape[2]
+                        x1[no_mask] = 0
+                        x2[no_mask] = pred_pixels.shape[3]
+                    fd_pixels = torch.stack([
+                        pred_pixels[b, :, y1[b]:y2[b], x1[b]:x2[b]]
+                        for b in range(B)
+                    ], dim=0)
+                else:
+                    fd_pixels = pred_pixels
+
+                # Compute FD-Loss (gradient-preserving) on crop-only pixels
+                fd_loss, fd_dict = fd_manager.compute_loss(fd_pixels)
 
                 # Add FD-Loss to total loss (weighted)
                 fd_weight = getattr(t, 'fd_loss_weight', 0.1)
                 loss = loss + fd_weight * fd_loss
 
-                # Enqueue features for next step (detached, no grad)
-                fd_manager.enqueue_features(pred_pixels)
+                # Enqueue features for next step (detached, no grad) — crop-only
+                fd_manager.enqueue_features(fd_pixels)
 
                 _fd_str = ", ".join([f"{k}={v:.2f}" for k, v in fd_dict.items()])
             else:

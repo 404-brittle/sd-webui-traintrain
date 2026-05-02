@@ -777,7 +777,8 @@ class FDLossManager(nn.Module):
         logger.info(f"[FDLossManager] Queue fill complete: {filled} features")
 
     @torch.no_grad()
-    def prefill_from_dataloader(self, dataloader, vae, num_samples: Optional[int] = None):
+    def prefill_from_dataloader(self, dataloader, vae, num_samples: Optional[int] = None,
+                                mask_key: Optional[str] = None):
         """Pre-fill feature queues with real data before training starts.
 
         Iterates the dataloader, decodes latents to pixels via the VAE,
@@ -785,10 +786,27 @@ class FDLossManager(nn.Module):
         the queue has enough samples for a non-degenerate covariance estimate
         from step 1 of training.
 
+        When ``mask_key`` is provided (e.g. ``"mask"`` in texture mode), only the
+        non-zero region of each sample's mask is cropped **in latent space** before
+        VAE decode — the background noise canvas is never decoded, saving ~16×
+        VAE compute (1024² canvas → 256² crop).  The feature queue then contains
+        only actual texture content, not frequency-matched noise.
+
+        The dataloader is iterated repeatedly until ``num_samples`` features have
+        been enqueued.  In texture mode each pass produces different random crops
+        from the same images, giving diverse features.  In full-res mode the same
+        images repeat, which is fine for initialising the covariance estimate.
+
+        VAE decode and feature extraction are the dominant costs; the per-batch
+        crop extraction is vectorised (no Python loop over samples) to keep GPU
+        utilisation high.
+
         Args:
             dataloader: Iterable yielding dicts with ``"latent"`` key.
             vae: VAE module with ``decode_to_pixels(latent) -> pixels``.
             num_samples: Number of samples to enqueue (default: queue_size).
+            mask_key: Optional key in the batch dict for a latent-space mask
+                      ``[B, H_lat, W_lat]`` that indicates the crop region.
         """
         if num_samples is None:
             num_samples = max(j["queue"].size for j in self.judges)
@@ -796,25 +814,76 @@ class FDLossManager(nn.Module):
         filled = 0
         logger.info(f"[FDLossManager] Pre-filling queues with {num_samples} real data features...")
 
-        for batch in dataloader:
-            if filled >= num_samples:
-                break
+        from tqdm import tqdm
+        pbar = tqdm(total=num_samples, desc="FD pre-fill", unit="img")
 
-            latents = batch["latent"].to(self.device)
-            batch_size = latents.shape[0]
-            remaining = num_samples - filled
-            count = min(batch_size, remaining)
+        # Iterate the dataloader repeatedly until we hit num_samples.
+        # Each pass yields different random crops in texture mode (__getitem__
+        # re-samples crop position/size every call), so this naturally produces
+        # diverse features even from a small image set.
+        # We use iter(dataloader) explicitly so we can re-create the iterator
+        # when it exhausts (ContinualRandomDataLoader raises StopIteration
+        # after one full pass through all data).
+        while filled < num_samples:
+            data_iter = iter(dataloader)
+            for batch in data_iter:
+                if filled >= num_samples:
+                    break
 
-            # Decode latents to pixels and enqueue features
-            pixels = vae.decode_to_pixels(latents[:count].float())
-            # decode_to_pixels returns [-1, 1]; FD-Loss expects [0, 1]
-            pixels = pixels * 0.5 + 0.5
-            self.enqueue_features(pixels)
+                latents = batch["latent"].to(self.device)
+                batch_size = latents.shape[0]
+                remaining = num_samples - filled
+                count = min(batch_size, remaining)
+                latents = latents[:count]
 
-            filled += count
-            if filled % 1000 == 0 or filled == num_samples:
-                logger.info(f"[FDLossManager] Pre-fill progress: {filled}/{num_samples}")
+                # --- Texture mode: crop latents FIRST, then VAE decode only the crop ---
+                # This avoids decoding the full noisy canvas (~1024² → ~256² = ~16× saving).
+                if mask_key is not None and mask_key in batch and batch[mask_key] is not None:
+                    mask_t = batch[mask_key][:count].to(self.device)  # [B, H_lat, W_lat]
+                    B = mask_t.shape[0]
 
+                    # Vectorised per-sample bounding box in latent space (cumsum trick)
+                    rows_any = (mask_t > 0.5).any(dim=2)   # [B, H_lat]
+                    cols_any = (mask_t > 0.5).any(dim=1)   # [B, W_lat]
+                    rows_cs = rows_any.cumsum(dim=1)
+                    rows_cs_rev = rows_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+                    cols_cs = cols_any.cumsum(dim=1)
+                    cols_cs_rev = cols_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+
+                    has_mask = rows_any.any(dim=1) & cols_any.any(dim=1)  # [B]
+                    y1 = ((rows_cs == 1) & rows_any).int().argmax(dim=1)   # [B]
+                    y2 = ((rows_cs_rev == 1) & rows_any).int().argmax(dim=1) + 1  # [B]
+                    x1 = ((cols_cs == 1) & cols_any).int().argmax(dim=1)   # [B]
+                    x2 = ((cols_cs_rev == 1) & cols_any).int().argmax(dim=1) + 1  # [B]
+
+                    no_mask = ~has_mask
+                    if no_mask.any():
+                        y1[no_mask] = 0
+                        y2[no_mask] = latents.shape[2]
+                        x1[no_mask] = 0
+                        x2[no_mask] = latents.shape[3]
+
+                    # Crop latents in latent space — VAE decode only the crop region
+                    cropped_latents = torch.stack([
+                        latents[b, :, y1[b]:y2[b], x1[b]:x2[b]]
+                        for b in range(B)
+                    ], dim=0)
+
+                    # VAE decode the cropped latents (small region, ~16× less work)
+                    pixels = vae.decode_to_pixels(cropped_latents.float())
+                else:
+                    # Full-res mode: decode the whole latent as-is
+                    pixels = vae.decode_to_pixels(latents.float())
+
+                # decode_to_pixels returns [-1, 1]; FD-Loss expects [0, 1]
+                pixels = pixels * 0.5 + 0.5
+
+                self.enqueue_features(pixels)
+
+                filled += count
+                pbar.update(count)
+
+        pbar.close()
         logger.info(f"[FDLossManager] Pre-fill complete: {filled} features enqueued")
 
     def state_dict(self):

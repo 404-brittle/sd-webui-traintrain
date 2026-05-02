@@ -123,6 +123,26 @@ network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", 
 LLRD_DECAYS = ["1.0", "0.98", "0.95", "0.9", "0.85", "0.8"]
 network_llrd_decay = ["network_llrd_decay", "DD", LLRD_DECAYS, "1.0", float, ALL]
 
+# --- FD-Loss (Representation Fréchet Distance) configuration ----------------
+# Enable/disable FD-Loss perceptual quality training
+fd_loss_enable      = ["fd_loss_enable",       "CH", None, False, bool, ALL]
+# Comma-separated list of representation models (timm model names, "inception", or "convnext")
+# Examples: "vit_base_patch14_dinov2", "convnextv2_base.fcmae_ft_in22k_in1k", "vit_large_patch14_clip_224.openai"
+# Aliases: "dinov2_vitb14" -> vit_base_patch14_dinov2, "dinov2_vitl14" -> vit_large_patch14_dinov2, "clip_vitl" -> vit_large_patch14_clip_224
+fd_repr_models      = ["fd_repr_models(repr models, comma-sep)", "TX", None, "vit_base_patch14_dinov2", str, ALL]
+# Feature queue size (number of features to buffer for FID computation)
+fd_queue_size       = ["fd_queue_size",         "TX", None, 50000, int, ALL]
+# Queue mode: "snapshot" (full buffer), "online_accum" (running sums), "ema" (exponential moving average)
+FD_QUEUE_MODES = ["snapshot", "online_accum", "ema"]
+fd_queue_mode       = ["fd_queue_mode",         "DD", FD_QUEUE_MODES, "online_accum", str, ALL]
+# EMA beta for queue mode "ema" (higher = slower adaptation)
+fd_ema_beta         = ["fd_ema_beta",           "TX", None, 0.9999, float, ALL]
+# Weight multiplier for FD-Loss added to the base MSE/L1 loss
+fd_loss_weight      = ["fd_loss_weight",        "TX", None, 0.1, float, ALL]
+# Epsilon for FID normalization (prevents extreme values from dominating)
+fd_fid_norm_eps     = ["fd_fid_norm_eps",       "TX", None, 1e-6, float, ALL]
+# ----------------------------------------------------------------------------
+
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
 r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, train_lr_scheduler_settings, save_lora_name, use_gradient_checkpointing]
@@ -133,7 +153,9 @@ o_column1 = [image_buckets_step, image_mirroring, image_use_filename_as_tag, ima
 o_column2 = [train_seed, train_loss_function, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column3 = [train_model_precision, train_lora_precision, save_precision,
-             train_repeat, gradient_accumulation_steps]
+             train_repeat, gradient_accumulation_steps,
+             fd_loss_enable, fd_repr_models, fd_queue_size, fd_queue_mode,
+             fd_ema_beta, fd_loss_weight, fd_fid_norm_eps]
 o_ts_column    = [train_min_timesteps, train_max_timesteps, train_timestep_distribution, train_ts_dist_params, train_ts_schedule, train_hybrid_mode]
 o_layer_column = [network_module_filter, network_llrd_decay]
 

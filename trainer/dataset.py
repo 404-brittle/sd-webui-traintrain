@@ -229,6 +229,9 @@ class LatentsConds(Dataset):
         # image_num_multiply hardcoded to 1
         if t.train_batch_size > len(self.latents_conds):
             self.latents_conds = self.latents_conds * t.train_batch_size
+        # Fixed canvas size for the entire epoch so all items in a batch share the
+        # same spatial dimensions (avoids DataLoader collation errors in texture mode).
+        self._current_canvas_hw = None
 
     def __len__(self):
         return len(self.latents_conds)
@@ -258,8 +261,8 @@ class LatentsConds(Dataset):
                 _, image, mask, emb1, emb2, canvas_hw, tile_res, tile_scale = item
 
                 _TEXTURE_CANVAS_PRESETS = [
-                    (640, 1536), (1536, 640),
-                    (832, 1216), (1216, 832),
+                    #(640, 1536), (1536, 640),
+                    #(832, 1216), (1216, 832),
                     (1024, 1024), (1024, 1024), #twice, for 1/3 chance.
                 ]
 
@@ -288,8 +291,11 @@ class LatentsConds(Dataset):
                     if cond2 is not None: batch["cond2"] = cond2 if isinstance(cond2, (str, tuple, list)) else cond2.squeeze().cpu()
                     return batch
 
-                # Randomise canvas resolution each step for aspect-ratio invariance
-                canvas_hw = random.choice(_TEXTURE_CANVAS_PRESETS)
+                # Fixed canvas size for the entire epoch so all items in a batch
+                # share the same spatial dimensions (avoids collation errors).
+                if self._current_canvas_hw is None:
+                    self._current_canvas_hw = random.choice(_TEXTURE_CANVAS_PRESETS)
+                canvas_hw = self._current_canvas_hw
 
                 # JIT: Randomly crop, scale, and encode
                 canvas_h, canvas_w = canvas_hw

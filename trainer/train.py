@@ -21,6 +21,7 @@ from trainer.anima_support import (
     expand_cond,
     move_cond_to_device,
 )
+from trainer.fd_loss import FDLossManager
 from pprint import pprint
 from accelerate.utils import set_seed
 
@@ -262,8 +263,40 @@ def train_lora(t):
     loss_velocity = None
 
     _train_hybrid = getattr(t, 'train_hybrid_mode', False)
-    # VAE must stay alive for JIT encoding: texture_mode OR hybrid mode
-    if not getattr(t, 'texture_mode', False) and not _train_hybrid:
+
+    # --- FD-Loss setup -------------------------------------------------------
+    _use_fd_loss = getattr(t, 'fd_loss_enable', False)
+    fd_manager = None
+    if _use_fd_loss:
+        t.a.print("Initializing FD-Loss...")
+        fd_repr_models = getattr(t, 'fd_repr_models', 'dinov2_vitb14').strip()
+        fd_repr_models = [m.strip() for m in fd_repr_models.split(",") if m.strip()]
+        fd_queue_size = getattr(t, 'fd_queue_size', 50000)
+        fd_queue_mode = getattr(t, 'fd_queue_mode', 'online_accum')
+        fd_ema_beta = getattr(t, 'fd_ema_beta', 0.9999)
+        fd_weight = getattr(t, 'fd_loss_weight', 0.1)
+        fd_fid_norm_eps = getattr(t, 'fd_fid_norm_eps', 1e-6)
+
+        fd_manager = FDLossManager(
+            repr_models=fd_repr_models,
+            queue_size=fd_queue_size,
+            queue_mode=fd_queue_mode,
+            ema_beta=fd_ema_beta,
+            weights=[fd_weight] * len(fd_repr_models),
+            fid_norm_eps=fd_fid_norm_eps,
+            device=CUDA,
+        )
+        t.a.print(f"  FD-Loss judges: {fd_repr_models}, queue_size={fd_queue_size}, mode={fd_queue_mode}")
+
+        # Pre-fill queues with real data so the covariance estimate is
+        # non-degenerate from step 1 (avoids eigendecomposition failures).
+        t.a.print("  Pre-filling FD-Loss queues with training data...")
+        fd_manager.prefill_from_dataloader(t.dataloader, t.vae)
+        t.a.print("  FD-Loss queues pre-filled.")
+    # -------------------------------------------------------------------------
+
+    # VAE must stay alive for JIT encoding: texture_mode OR hybrid mode OR fd_loss
+    if not getattr(t, 'texture_mode', False) and not _train_hybrid and not _use_fd_loss:
         del t.vae
         if "BASE" not in t.network_blocks:
             del t.text_model
@@ -340,11 +373,47 @@ def train_lora(t):
                     mask=train_mask,
                 )
 
+                # --- FD-Loss: perceptual quality via differentiable FID ----------
+                if _use_fd_loss and fd_manager is not None:
+                    # Reconstruct predicted clean latents from velocity prediction
+                    # Flow matching: noisy = (1-t)*clean + t*noise
+                    # velocity = noise - clean  (predicted)
+                    # So: pred_clean = noisy_latents - timesteps_normalized * model_pred
+                    # where timesteps_normalized = timesteps / 1000
+                    ts_norm = timesteps.float() / 1000.0  # [B] in [0, 1]
+                    # pred_velocity = model_pred (what the model predicts)
+                    # clean = noisy - ts * velocity  (rearranged from noisy = clean + ts * velocity)
+                    # But flow matching uses: noisy = (1-t)*clean + t*noise
+                    # So: velocity = noise - clean
+                    #     noisy = clean + ts * velocity
+                    #     clean = noisy - ts * velocity
+                    pred_clean = noisy_latents.float() - ts_norm.view(-1, 1, 1, 1) * model_pred.float()
+
+                    # Decode predicted clean latents to pixels [0, 1]
+                    pred_pixels = latent2pixels(t, pred_clean)
+
+                    # Compute FD-Loss (gradient-preserving)
+                    fd_loss, fd_dict = fd_manager.compute_loss(pred_pixels)
+
+                    # Add FD-Loss to total loss (weighted)
+                    fd_weight = getattr(t, 'fd_loss_weight', 0.1)
+                    loss = loss + fd_weight * fd_loss
+
+                    # Enqueue features for next step (detached, no grad)
+                    fd_manager.enqueue_features(pred_pixels)
+
+                    # Log FID values
+                    _fd_str = ", ".join([f"{k}={v:.2f}" for k, v in fd_dict.items()])
+                else:
+                    _fd_str = ""
+                # -----------------------------------------------------------------
+
                 c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
                 _mode_tag = f"/{t.hybrid_processing_mode}" if _train_hybrid and hasattr(t, 'hybrid_processing_mode') else ""
+                _fd_tag = f" FD: {_fd_str}" if _fd_str else ""
                 pbar.set_description(
                     f"Loss EMA * 1000: {loss_ema * 1000:.4f}, LR: " + ", ".join(c_lrs) +
-                    f", TS: {ts_lo}-{ts_hi}{_mode_tag}, Epoch: {t.dataloader.epoch}"
+                    f", TS: {ts_lo}-{ts_hi}{_mode_tag}{_fd_tag}, Epoch: {t.dataloader.epoch}"
                 )
                 pbar.update(1)
 
@@ -396,7 +465,38 @@ def train_diff2(t):
     if not t.dataloader.data:
         return "No data!"
 
-    if not getattr(t, 'texture_mode', False):
+    # --- FD-Loss setup -------------------------------------------------------
+    _use_fd_loss = getattr(t, 'fd_loss_enable', False)
+    fd_manager = None
+    if _use_fd_loss:
+        t.a.print("Initializing FD-Loss...")
+        fd_repr_models = getattr(t, 'fd_repr_models', 'dinov2_vitb14').strip()
+        fd_repr_models = [m.strip() for m in fd_repr_models.split(",") if m.strip()]
+        fd_queue_size = getattr(t, 'fd_queue_size', 50000)
+        fd_queue_mode = getattr(t, 'fd_queue_mode', 'online_accum')
+        fd_ema_beta = getattr(t, 'fd_ema_beta', 0.9999)
+        fd_weight = getattr(t, 'fd_loss_weight', 0.1)
+        fd_fid_norm_eps = getattr(t, 'fd_fid_norm_eps', 1e-6)
+
+        fd_manager = FDLossManager(
+            repr_models=fd_repr_models,
+            queue_size=fd_queue_size,
+            queue_mode=fd_queue_mode,
+            ema_beta=fd_ema_beta,
+            weights=[fd_weight] * len(fd_repr_models),
+            fid_norm_eps=fd_fid_norm_eps,
+            device=CUDA,
+        )
+        t.a.print(f"  FD-Loss judges: {fd_repr_models}, queue_size={fd_queue_size}, mode={fd_queue_mode}")
+
+        # Pre-fill queues with real data so the covariance estimate is
+        # non-degenerate from step 1 (avoids eigendecomposition failures).
+        t.a.print("  Pre-filling FD-Loss queues with training data...")
+        fd_manager.prefill_from_dataloader(t.dataloader, t.vae)
+        t.a.print("  FD-Loss queues pre-filled.")
+    # -------------------------------------------------------------------------
+
+    if not getattr(t, 'texture_mode', False) and not _use_fd_loss:
         del t.vae
         if "BASE" not in t.network_blocks:
             del t.text_model
@@ -491,10 +591,39 @@ def train_diff2(t):
                 t, targ_noise_pred, orig_noise_pred, timesteps, loss_ema, loss_velocity
             )
 
+            # --- FD-Loss: perceptual quality via differentiable FID ----------
+            if _use_fd_loss and fd_manager is not None:
+                # Reconstruct predicted clean latents from the LoRA-modified prediction
+                # Flow matching: noisy = (1-t)*clean + t*noise
+                # velocity = noise - clean
+                # pred_clean = noisy - ts * velocity
+                ts_norm = timesteps.float() / 1000.0
+                # Use the target (LoRA-modified) prediction for FD-Loss evaluation
+                pred_clean = targ_noisy_latents.float() - ts_norm.view(-1, 1, 1, 1) * targ_noise_pred.float()
+
+                # Decode predicted clean latents to pixels [0, 1]
+                pred_pixels = latent2pixels(t, pred_clean)
+
+                # Compute FD-Loss (gradient-preserving)
+                fd_loss, fd_dict = fd_manager.compute_loss(pred_pixels)
+
+                # Add FD-Loss to total loss (weighted)
+                fd_weight = getattr(t, 'fd_loss_weight', 0.1)
+                loss = loss + fd_weight * fd_loss
+
+                # Enqueue features for next step (detached, no grad)
+                fd_manager.enqueue_features(pred_pixels)
+
+                _fd_str = ", ".join([f"{k}={v:.2f}" for k, v in fd_dict.items()])
+            else:
+                _fd_str = ""
+            # -----------------------------------------------------------------
+
             c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
+            _fd_tag = f" FD: {_fd_str}" if _fd_str else ""
             pbar.set_description(
                 f"Loss EMA * 1000: {loss_ema * 1000:.4f}, Loss Velocity: {loss_velocity * 1000:.4f}, "
-                f"Current LR: " + ", ".join(c_lrs) + f", Epoch: {epoch}"
+                f"Current LR: " + ", ".join(c_lrs) + f", Epoch: {epoch}{_fd_tag}"
             )
             pbar.update(1)
 
@@ -806,6 +935,26 @@ def image2latent(t, image):
         latent = t.vae.encode_pixels_to_latents(image_tensor)  # [1, C, H, W]
 
     return latent
+
+
+def latent2pixels(t, latent):
+    """Decode VAE latents back to pixel space [0, 1] for FD-Loss feature extraction.
+
+    Gradients flow through the VAE decode (VAE is frozen, so this is safe).
+    The VAE's decode_to_pixels handles the latent normalization internally.
+
+    Args:
+        t: Trainer instance with .vae attribute.
+        latent: Tensor [B, C, H, W] in VAE latent space.
+
+    Returns:
+        Tensor [B, 3, H*8, W*8] in [0, 1] range.
+    """
+    # decode_to_pixels expects [B, C, H, W] or [B, C, 1, H, W]
+    # Returns [-1, 1] range. VAE is frozen so gradients pass through safely.
+    pixels = t.vae.decode_to_pixels(latent.float())
+    # [-1, 1] -> [0, 1] for FD-Loss feature extractors (expect [0, 1] input)
+    return pixels * 0.5 + 0.5
 
 
 def text2cond(t, prompt):

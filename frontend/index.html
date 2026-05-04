@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TrainTrain</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header class="app-header">
+      <h1>TrainTrain</h1>
+      <span class="subtitle">Anima LoRA / ADDifT Trainer</span>
+    </header>
+
+    <!-- Message bar -->
+    <div id="message-bar" class="message-bar" style="display:none;"></div>
+
+    <!-- Control tabs -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="train">Train</button>
+      <button class="tab-btn" data-tab="fd-cluster">FD Cluster Inspector</button>
+    </div>
+
+    <!-- ===================== TRAIN TAB ===================== -->
+    <div id="tab-train" class="tab-content active">
+
+      <!-- Action buttons -->
+      <div class="action-row">
+        <button id="btn-start" class="btn btn-primary" type="button">▶ Start Training</button>
+        <button id="btn-stop" class="btn btn-danger" type="button">⏹ Stop</button>
+        <button id="btn-stop-save" class="btn btn-danger" type="button">⏹ Stop & Save</button>
+      </div>
+
+      <!-- Presets & JSON -->
+      <div class="preset-row">
+        <div class="preset-group">
+          <select id="preset-select" class="form-select" autocomplete="off"></select>
+          <button id="btn-load-preset" class="btn btn-sm" type="button" title="Load preset">↙</button>
+          <button id="btn-save-preset" class="btn btn-sm" type="button" title="Save preset">💾</button>
+          <button id="btn-refresh-presets" class="btn btn-sm" type="button" title="Refresh presets">🔄</button>
+        </div>
+        <div class="preset-group">
+          <input type="text" id="json-file" class="form-input" placeholder="JSON filename..." autocomplete="off">
+          <button id="btn-open-folder" class="btn btn-sm" type="button" title="Open jsons folder">📂</button>
+          <button id="btn-load-json" class="btn btn-sm" type="button" title="Load JSON">↙</button>
+        </div>
+      </div>
+
+      <!-- Mode + Model + VAE -->
+      <div class="mode-model-row">
+        <div class="field-group">
+          <label for="mode-select">Mode</label>
+          <select id="mode-select" class="form-select" autocomplete="off">
+            <option value="LoRA">LoRA</option>
+            <option value="ADDifT">ADDifT</option>
+            <option value="Multi-ADDifT">Multi-ADDifT</option>
+          </select>
+        </div>
+        <div class="field-group flex-2">
+          <label for="model-path">Anima DiT Path (.safetensors)</label>
+          <input type="text" id="model-path" class="form-input" placeholder="path/to/model.safetensors" autocomplete="off">
+        </div>
+        <div class="field-group flex-2">
+          <label for="vae-path">VAE Path (.safetensors)</label>
+          <input type="text" id="vae-path" class="form-input" placeholder="path/to/vae.safetensors" autocomplete="off">
+        </div>
+      </div>
+
+      <!-- Qwen3 + T5 -->
+      <div class="mode-model-row">
+        <div class="field-group flex-2">
+          <label for="qwen3-path">Qwen3 Path</label>
+          <input type="text" id="qwen3-path" class="form-input" autocomplete="off">
+        </div>
+        <div class="field-group flex-2">
+          <label for="t5-path">T5 Tokenizer Path (optional)</label>
+          <input type="text" id="t5-path" class="form-input" autocomplete="off">
+        </div>
+      </div>
+
+      <!-- ===== Required Parameters ===== -->
+      <details class="section" open>
+        <summary class="section-title">Required Parameters</summary>
+        <div class="section-grid cols-3" id="required-params"></div>
+      </details>
+
+      <!-- ===== Bucket / Texture Parameters ===== -->
+      <details class="section" open>
+        <summary class="section-title">Buckets & Texture</summary>
+        <div class="section-grid cols-3" id="bucket-params"></div>
+      </details>
+
+      <!-- ===== FD-Loss Parameters ===== -->
+      <details class="section" open>
+        <summary class="section-title">FD-Loss</summary>
+        <div class="section-grid cols-3" id="fd-params"></div>
+      </details>
+
+      <!-- ===== Other Options ===== -->
+      <details class="section" open>
+        <summary class="section-title">Other Options</summary>
+        <div class="section-grid cols-3" id="option-params"></div>
+      </details>
+
+      <!-- ===== Timestep Distribution ===== -->
+      <details class="section" open>
+        <summary class="section-title">Timestep Distribution</summary>
+        <div class="ts-row">
+          <div class="ts-controls" id="ts-controls"></div>
+          <div class="ts-preview" id="ts-preview"></div>
+        </div>
+        <div class="ts-sliders" id="ts-sliders">
+          <!-- flow_shift slider -->
+          <div class="slider-group" id="slider-group-flow-shift" style="display:none;">
+            <label>flow shift</label>
+            <input type="range" id="slider-fs" min="0.05" max="5.0" step="0.05" value="3.0">
+            <span class="slider-val" id="slider-fs-val">3.0</span>
+          </div>
+          <!-- logit_normal sliders -->
+          <div class="slider-group" id="slider-group-logit" style="display:none;">
+            <label>mean</label>
+            <input type="range" id="slider-mean" min="-4.0" max="4.0" step="0.1" value="0.0">
+            <span class="slider-val" id="slider-mean-val">0.0</span>
+            <label>std</label>
+            <input type="range" id="slider-std" min="0.1" max="4.0" step="0.05" value="1.0">
+            <span class="slider-val" id="slider-std-val">1.0</span>
+          </div>
+          <!-- beta sliders -->
+          <div class="slider-group" id="slider-group-beta" style="display:none;">
+            <label>alpha</label>
+            <input type="range" id="slider-alpha" min="0.1" max="20.0" step="0.1" value="0.5">
+            <span class="slider-val" id="slider-alpha-val">0.5</span>
+            <label>beta</label>
+            <input type="range" id="slider-beta" min="0.1" max="20.0" step="0.1" value="0.5">
+            <span class="slider-val" id="slider-beta-val">0.5</span>
+          </div>
+        </div>
+      </details>
+
+      <!-- ===== Layers ===== -->
+      <details class="section" open>
+        <summary class="section-title">Layers</summary>
+        <div class="layer-row">
+          <div class="layer-controls" id="layer-controls"></div>
+          <div class="layer-preview" id="layer-preview"></div>
+        </div>
+      </details>
+
+      <!-- ===== Image Pairs (ADDifT) ===== -->
+      <details class="section" id="diff-section" style="display:none;">
+        <summary class="section-title">Image Pairs (Original → Target)</summary>
+        <div class="image-pair-row">
+          <div class="image-upload">
+            <label>Original Image</label>
+            <input type="file" id="orig-image" accept="image/*">
+            <img id="orig-image-preview" class="image-preview" style="display:none;">
+          </div>
+          <div class="image-upload">
+            <label>Target Image</label>
+            <input type="file" id="targ-image" accept="image/*">
+            <img id="targ-image-preview" class="image-preview" style="display:none;">
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <!-- ===================== FD CLUSTER TAB ===================== -->
+    <div id="tab-fd-cluster" class="tab-content">
+      <div class="fd-header">
+        <p class="fd-desc">Interactive cluster panel for FD-Loss feature queues. Start training with <strong>fd_loss_enable</strong> checked, then click <strong>Refresh</strong> to inspect clusters.</p>
+      </div>
+      <div id="fd-active-count" class="fd-active-count" style="display:none;margin-bottom:6px;padding:4px 10px;background:rgba(96,165,250,0.06);border:1px solid rgba(96,165,250,0.2);border-radius:3px;font-size:12px;color:#93c5fd;"></div>
+      <div id="fd-pause-status" class="fd-pause-status"></div>
+      <div class="fd-controls">
+        <button id="fd-resume-btn" class="btn btn-primary" type="button">▶️ Resume Training</button>
+        <button id="fd-refresh-btn" class="btn btn-secondary" type="button">🔄 Refresh Cluster Panel</button>
+        <div class="field-group">
+          <label for="fd-n-clusters">Clusters</label>
+          <input type="number" id="fd-n-clusters" class="form-input" value="20" min="2" max="200" step="1" autocomplete="off">
+        </div>
+        <div class="field-group">
+          <label for="fd-max-thumbs">Thumbnails per cluster</label>
+          <input type="number" id="fd-max-thumbs" class="form-input" value="9" min="1" max="50" step="1" autocomplete="off">
+        </div>
+        <div class="field-group">
+          <label for="fd-thumb-scale">Thumbnail scale</label>
+          <input type="range" id="fd-thumb-scale" min="0.5" max="3.0" step="0.1" value="1.0">
+          <span class="slider-val" id="fd-thumb-scale-val">1.0</span>
+        </div>
+      </div>
+      <div id="fd-cluster-html" class="fd-cluster-container">
+        <div class="fd-placeholder">FD-Loss not active. Enable <strong>fd_loss_enable</strong> and start training.</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -6,7 +6,6 @@ import torch
 import subprocess
 import sys
 import torch.nn as nn
-import gradio as gr
 from datetime import datetime
 from typing import Literal
 from diffusers.optimization import get_scheduler
@@ -30,8 +29,17 @@ presetspath = os.path.join(path_root,"presets")
 os.makedirs(presetspath, exist_ok=True)
 
 class Trainer():
-    def __init__(self, jsononly, model, vae, mode, values):
-        self.values = values
+    def __init__(self, jsononly, model, vae, mode, config: dict, images=None):
+        """
+        Args:
+            jsononly: If True, only save preset JSON (no training).
+            model: Path to the model.
+            vae: Path to the VAE.
+            mode: Training mode ("LoRA", "ADDifT", "Multi-ADDifT").
+            config: Named dict of configuration values (keys match all_configs names).
+            images: Optional list/tuple of [orig_image_data, targ_image_data].
+        """
+        self.config = config
         self.mode = mode
         self.use_8bit = False
         self.count_dict = {}
@@ -39,7 +47,7 @@ class Trainer():
 
         self.save_dir = os.environ.get("LORA_DIR", os.path.join(path_root, "output"))
         os.makedirs(self.save_dir, exist_ok=True)
-        self.setpass(0)
+        self._apply_config()
 
         self.image_size = [int(x) for x in self.image_size.split(",")]
         if len(self.image_size) == 1:
@@ -59,72 +67,72 @@ class Trainer():
         self.diff_alt_ratio         = 1.0
 
         self.gradient_accumulation_steps = 1
-        # train_repeat is configurable — do not override here; setpass already set it.
         if not hasattr(self, "train_repeat"):
             self.train_repeat = 1
         self.total_images = 0
         
         self.checkfile()
 
-        # values = [all_configs..., dummy, orig_image, targ_image]
-        clen = len(all_configs) + 1  # +1 for dummy checkbox
-
-        self.images = values[clen:]  # [orig_image, targ_image]
+        self.images = images if images is not None else []
 
         self.add_dcit = {"mode": mode, "model": model, "vae": vae}
 
         self.export_json(jsononly)
 
-    def setpass(self, pas, set = True):
-        values_0 = self.values[:len(all_configs)]
-        values_1 = self.values[len(all_configs):len(all_configs) * 2]
-        if pas == 1:
-            if values_1[-1]:
-                if set: print("Use 2nd pass settings")
-            else:
-                return
-        jdict = {}
-        for i, (sets, value) in enumerate(zip(all_configs, values_1 if pas > 0 else values_0)):
-            jdict[sets[0]] = value
-    
-            if pas > 0:
-                if not sets[5][3]:
-                    value = values_0[i]
+    def _apply_config(self):
+        """Apply the named config dict to self attributes, with type coercion."""
+        for sets in all_configs:
+            name = sets[0]
+            dtype = sets[4]
+            default = sets[3]
+            value = self.config.get(name, default)
 
-            if not isinstance(value, sets[4]):
+            # Coerce type if needed
+            if not isinstance(value, dtype):
                 try:
-                    value = sets[4](value)
-                except:
-                    if not sets[0] == "train_textencoder_learning_rate":
-                        print(f"ERROR, input value for {sets[0]} : {sets[4]} is invalid, use default value {sets[3]}")
-                    value = sets[3]
-            if "precision" in sets[0]:
-                if sets[0] == "train_model_precision" and value == "fp8":
-                    self.use_8bit == True
+                    value = dtype(value)
+                except (ValueError, TypeError):
+                    print(f"WARNING: input value for {name} : {type(value)} is invalid, use default value {default}")
+                    value = default
+
+            # Precision special handling
+            if "precision" in name:
+                if name == "train_model_precision" and value == "fp8":
+                    self.use_8bit = True
                     print("Use 8bit Model Precision")
                 value = parse_precision(value)
 
-            if "train_optimizer" == sets[0]:
+            # Optimizer name → lowercase
+            if name == "train_optimizer":
                 value = value.lower()
-            
-            if "train_optimizer_settings" == sets[0] or "train_lr_scheduler_settings" == sets[0]:
-                dvalue = {}
-                if value is not None and len(value.strip()) > 0:
-                    # 改行や空白を取り除きつつ処理
-                    value = value.replace(" ", "").replace(";","\n")
-                    args = value.split("\n")
-                    for arg in args:
-                        if "=" in arg:  # "=" が存在しない場合は無視
-                            key, val = arg.split("=", 1)
-                            val = ast.literal_eval(val)  # リテラル評価で型を適切に変換
-                            dvalue[key] = val
-                value = dvalue
-            if set:
-                setattr(self, sets[0].split("(")[0], value)
 
-        if set:
-            self.network_blocks = list(BLOCKID_ANIMA)
+            # Optimizer / scheduler settings: parse key=value text into dict
+            if name in ("train_optimizer_settings", "train_lr_scheduler_settings"):
+                dvalue = {}
+                if value is not None and isinstance(value, str) and len(value.strip()) > 0:
+                    text = value.replace(" ", "").replace(";", "\n")
+                    for line in text.split("\n"):
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            try:
+                                v = ast.literal_eval(v)
+                            except (ValueError, SyntaxError):
+                                pass
+                            dvalue[k] = v
+                value = dvalue
+
+            setattr(self, name.split("(")[0], value)
+
+        self.network_blocks = list(BLOCKID_ANIMA)
         self.mode_fixer()
+
+    def setpass(self, pas, set=True):
+        """Legacy compatibility stub — returns config dict without reapplying."""
+        jdict = {}
+        for sets in all_configs:
+            name = sets[0]
+            jdict[name] = self.config.get(name, sets[3])
+        jdict.update(self.add_dcit)
         return jdict
 
     savedata = ["model", "vae", ]
@@ -213,7 +221,7 @@ def import_json(name, preset = False):
     # Return [mode, model, vae] + all_configs + [dummy] on failure
     null_len = 3 + len(all_configs) + 1
     if filepath is None:
-        return [gr.update()] * null_len
+        return [None] * null_len
     with open(filepath, 'r', encoding='utf-8') as file:
         data = json.load(file)
 

@@ -96,24 +96,6 @@ train_ts_schedule   = ["train_ts_schedule",   "ML", None, "",   str,   ALL]
 train_hybrid_mode   = ["train_hybrid_mode",   "CH", None, False, bool, ALL]
 network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", None, "", str, ALL]
 
-# FD-Loss
-fd_loss_enable      = ["fd_loss_enable",       "CH", None, False, bool, ALL]
-fd_repr_models      = ["fd_repr_models(repr models, comma-sep)", "TX", None, "vit_base_patch14_dinov2", str, ALL]
-fd_queue_size       = ["fd_queue_size",         "TX", None, 50000, int, ALL]
-FD_QUEUE_MODES = ["snapshot", "online_accum", "ema"]
-fd_queue_mode       = ["fd_queue_mode",         "DD", FD_QUEUE_MODES, "online_accum", str, ALL]
-fd_ema_beta         = ["fd_ema_beta",           "TX", None, 0.9999, float, ALL]
-fd_loss_weight      = ["fd_loss_weight",        "TX", None, 0.1, float, ALL]
-fd_fid_norm_eps     = ["fd_fid_norm_eps",       "TX", None, 1e-6, float, ALL]
-FD_EVICTION_MODES = ["fifo", "diversity", "guided"]
-fd_eviction_mode    = ["fd_eviction_mode",      "DD", FD_EVICTION_MODES, "fifo", str, ALL]
-fd_guidance_strength = ["fd_guidance_strength",  "TX", None, 0.5, float, ALL]
-fd_n_clusters       = ["fd_n_clusters",          "TX", None, 20, int, ALL]
-fd_cluster_log_interval = ["fd_cluster_log_interval", "TX", None, 0, int, ALL]
-fd_store_source_images = ["fd_store_source_images", "CH", None, False, bool, ALL]
-fd_enqueue_generated   = ["fd_enqueue_generated",   "CH", None, True,  bool, ALL]
-fd_pause_interval    = ["fd_pause_interval",       "TX", None, 0, int, ALL]
-
 # Column groupings
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
@@ -123,13 +105,6 @@ r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, trai
 b_column = [image_buckets_step, image_mirroring, image_use_filename_as_tag, image_disable_upscale,
             train_fixed_timsteps_in_batch, texture_mode, texture_feather_latent_px, texture_mask_directory,
             texture_tile_scale, texture_tile_resolution, texture_energy_threshold]
-
-# FD-Loss parameters
-f_column = [fd_loss_enable, fd_repr_models, fd_queue_size, fd_queue_mode,
-            fd_ema_beta, fd_loss_weight, fd_fid_norm_eps,
-            fd_eviction_mode, fd_guidance_strength, fd_n_clusters,
-            fd_cluster_log_interval, fd_store_source_images,
-            fd_enqueue_generated, fd_pause_interval]
 
 # Other Options (everything else)
 o_column1 = [train_seed, train_loss_function, save_per_steps,
@@ -142,4 +117,4 @@ o_layer_column = [network_module_filter]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 
-trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + b_column + f_column + o_column1 + o_column2 + o_ts_column + o_layer_column
+trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + b_column + o_column1 + o_column2 + o_ts_column + o_layer_column

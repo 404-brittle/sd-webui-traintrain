@@ -21,30 +21,9 @@ from trainer.anima_support import (
     expand_cond,
     move_cond_to_device,
 )
-from trainer.fd_loss import FDLossManager
 from pprint import pprint
 from typing import Optional
 from accelerate.utils import set_seed
-
-# Module-level FD-Loss manager reference, set during training so the Gradio UI
-# can access the interactive cluster panel while training is running.
-_fd_manager: Optional[FDLossManager] = None
-
-# Pause-and-inspect mechanism for interactive guidance.
-# When _fd_pause_step is set, the training loop will pause at that step
-# and wait for the user to inspect clusters and perform guidance actions.
-_fd_pause_step: int = 0          # step at which to pause (0 = no pause)
-_fd_last_pause_step: int = 0     # last step that was paused (preserved for "continuing from step" message)
-_fd_pause_interval: int = 0      # pause every N steps (0 = disabled)
-_fd_resume_signal: bool = False  # set True by UI to resume training
-_fd_paused: bool = False         # True while training is paused
-_fd_just_resumed: bool = False   # transient flag: True briefly after resume so get_pause_status_html shows "Resumed"
-
-# Add sd-scripts root to path for library imports
-_TRAINTRAIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SD_SCRIPTS_ROOT = os.environ.get("SD_SCRIPTS_PATH") or os.path.dirname(_TRAINTRAIN_DIR)
-if _SD_SCRIPTS_ROOT not in sys.path:
-    sys.path.insert(0, _SD_SCRIPTS_ROOT)
 
 try:
     from modules import shared
@@ -144,7 +123,6 @@ def train_named(jsononly: bool, mode: str, modelname: str, vaename: str,
 
 def train_main(jsononly, mode, modelname, vaename, *args):
     """Legacy positional-args entry point (kept for backward compat)."""
-    global _fd_pause_step, _fd_pause_interval, _fd_resume_signal, _fd_paused
     # Convert positional args to named dict
     config = {}
     for i, sets in enumerate(trainer.all_configs):
@@ -157,7 +135,6 @@ def train_main(jsononly, mode, modelname, vaename, *args):
 
 def _train_impl(jsononly, mode, modelname, vaename, config, images=None, t=None):
     """Shared training logic used by both train() and train_named()."""
-    global _fd_pause_step, _fd_pause_interval, _fd_resume_signal, _fd_paused
     if t is None:
         t = trainer.Trainer(jsononly, modelname, vaename, mode, config, images)
 
@@ -175,7 +152,8 @@ def _train_impl(jsononly, mode, modelname, vaename, config, images=None, t=None)
     # ------------------------------------------------------------------ #
     # Load Anima-specific libraries                                        #
     # ------------------------------------------------------------------ #
-    from library import anima_utils, qwen_image_autoencoder_kl
+    from trainer import _anima_utils as anima_utils
+    from trainer import qwen_image_autoencoder_kl
 
     t.sd_typer()
 
@@ -298,7 +276,6 @@ def _train_impl(jsononly, mode, modelname, vaename, config, images=None, t=None)
 
 def train_lora(t):
     global stoptimer
-    global _fd_pause_interval, _fd_paused, _fd_resume_signal, _fd_pause_step, _fd_last_pause_step
     stoptimer = 0
 
     t.a.print("Preparing image latents and text-conditional...")
@@ -318,79 +295,8 @@ def train_lora(t):
 
     _train_hybrid = getattr(t, 'train_hybrid_mode', False)
 
-    # --- FD-Loss setup -------------------------------------------------------
-    _use_fd_loss = getattr(t, 'fd_loss_enable', False)
-    fd_manager = None
-    if _use_fd_loss:
-        t.a.print("Initializing FD-Loss...")
-        fd_repr_models = getattr(t, 'fd_repr_models', 'dinov2_vitb14').strip()
-        fd_repr_models = [m.strip() for m in fd_repr_models.split(",") if m.strip()]
-        fd_queue_size = getattr(t, 'fd_queue_size', 50000)
-        fd_queue_mode = getattr(t, 'fd_queue_mode', 'online_accum')
-        fd_ema_beta = getattr(t, 'fd_ema_beta', 0.9999)
-        fd_weight = getattr(t, 'fd_loss_weight', 0.1)
-        fd_fid_norm_eps = getattr(t, 'fd_fid_norm_eps', 1e-6)
-        # --- New: intelligent queue management parameters ---
-        fd_eviction_mode = getattr(t, 'fd_eviction_mode', 'fifo')
-        fd_guidance_strength = getattr(t, 'fd_guidance_strength', 0.5)
-        fd_n_clusters = getattr(t, 'fd_n_clusters', 20)
-        fd_cluster_log_interval = getattr(t, 'fd_cluster_log_interval', 0)  # 0 = disabled
-        fd_store_source_images = getattr(t, 'fd_store_source_images', False)
-        fd_enqueue_generated = getattr(t, 'fd_enqueue_generated', True)
-        fd_pause_interval = getattr(t, 'fd_pause_interval', 0)  # 0 = disabled
-        # Warmup: skip enqueuing generated features for the first N training steps.
-        # During warmup, FD-Loss is still computed against the pre-filled real data
-        # reference, but the model's own (noisy) outputs are not injected into the
-        # queue — preventing early garbage from polluting the reference distribution.
-        # The effective warmup is fd_warmup_steps * batch_size * grad_accum steps
-        # worth of generated features that would otherwise contaminate the queue.
-        fd_warmup_steps = getattr(t, 'fd_warmup_steps', 0)  # 0 = disabled
-        # ----------------------------------------------------
-        # Set pause interval on module-level variable for UI access
-        _fd_pause_interval = fd_pause_interval
-
-        fd_manager = FDLossManager(
-            repr_models=fd_repr_models,
-            queue_size=fd_queue_size,
-            queue_mode=fd_queue_mode,
-            ema_beta=fd_ema_beta,
-            weights=[fd_weight] * len(fd_repr_models),
-            fid_norm_eps=fd_fid_norm_eps,
-            device=CUDA,
-            # --- New ---
-            eviction_mode=fd_eviction_mode,
-            guidance_strength=fd_guidance_strength,
-            n_clusters=fd_n_clusters,
-            store_source_images=fd_store_source_images,
-            enqueue_generated=fd_enqueue_generated,
-        )
-        t.a.print(f"  FD-Loss judges: {fd_repr_models}, queue_size={fd_queue_size}, mode={fd_queue_mode}, eviction={fd_eviction_mode}")
-
-        # Expose to Gradio UI via module-level reference
-        global _fd_manager
-        _fd_manager = fd_manager
-
-        # Pre-fill queues with real data so the covariance estimate is
-        # non-degenerate from step 1 (avoids eigendecomposition failures).
-        # In texture mode, pass mask_key="mask" so only the crop region is
-        # enqueued — the frequency-matched noise background is excluded.
-        _pf_mask_key = "mask" if getattr(t, 'texture_mode', False) else None
-        t.a.print("  Pre-filling FD-Loss queues with training data...")
-        fd_manager.prefill_from_dataloader(t.dataloader, t.vae, mask_key=_pf_mask_key)
-        t.a.print("  FD-Loss queues pre-filled.")
-
-        # Log initial cluster structure if interval is set
-        _fd_cluster_step = fd_cluster_log_interval
-        if _fd_cluster_step > 0:
-            try:
-                _html = fd_manager.get_cluster_summary_html()
-                t.a.print(f"  Initial queue clusters:\n{_html}")
-            except Exception:
-                pass
-    # -------------------------------------------------------------------------
-
-    # VAE must stay alive for JIT encoding: texture_mode OR hybrid mode OR fd_loss
-    if not getattr(t, 'texture_mode', False) and not _train_hybrid and not _use_fd_loss:
+    # VAE must stay alive for JIT encoding: texture_mode OR hybrid mode
+    if not getattr(t, 'texture_mode', False) and not _train_hybrid:
         del t.vae
         if "BASE" not in t.network_blocks:
             del t.text_model
@@ -418,7 +324,12 @@ def train_lora(t):
     while t.train_iterations >= pbar.n:
         for batch in t.dataloader:
             for i in range(t.train_repeat):
-                latents = batch["latent"].to(CUDA, dtype=t.train_lora_precision)
+                # Cast latents to train_model_precision (e.g. bf16) to match the model dtype.
+                # Using train_lora_precision (default fp32) causes a dtype mismatch inside
+                # Block._forward where torch.autocast(enabled=False) disables autocast,
+                # so F.linear(float32_input, bf16_weight) fails without autocast to cast
+                # the input. sd-scripts avoids this because its VAE caches latents in bf16.
+                latents = batch["latent"].to(CUDA, dtype=t.train_model_precision)
                 conds1 = batch["cond1"] if "cond1" in batch else None
 
                 noise = torch.randn_like(latents)
@@ -467,126 +378,11 @@ def train_lora(t):
                     mask=train_mask,
                 )
 
-                # --- FD-Loss: perceptual quality via differentiable FID ----------
-                if _use_fd_loss and fd_manager is not None:
-                    # Reconstruct predicted clean latents from velocity prediction
-                    # Flow matching: noisy = (1-t)*clean + t*noise
-                    # velocity = noise - clean  (predicted)
-                    # So: pred_clean = noisy_latents - timesteps_normalized * model_pred
-                    # where timesteps_normalized = timesteps / 1000
-                    ts_norm = timesteps.float() / 1000.0  # [B] in [0, 1]
-                    # pred_velocity = model_pred (what the model predicts)
-                    # clean = noisy - ts * velocity  (rearranged from noisy = clean + ts * velocity)
-                    # But flow matching uses: noisy = (1-t)*clean + t*noise
-                    # So: velocity = noise - clean
-                    #     noisy = clean + ts * velocity
-                    #     clean = noisy - ts * velocity
-                    pred_clean = noisy_latents.float() - ts_norm.view(-1, 1, 1, 1) * model_pred.float()
-
-                    # Decode predicted clean latents to pixels [0, 1]
-                    pred_pixels = latent2pixels(t, pred_clean)
-
-                    # In texture mode, the batch contains a full canvas with frequency-matched
-                    # noise background + a placed crop.  We must feed ONLY the crop region to
-                    # FD-Loss — the background noise would pollute the feature queue and make
-                    # the FID comparison meaningless (comparing noise distributions vs real data).
-                    # The mask (latent-space, [B, H_lat, W_lat]) is non-zero only on the crop.
-                    if train_mask is not None:
-                        # Vectorised per-sample bounding box from latent-space mask.
-                        # mask_t: [B, H_lat, W_lat], pred_pixels: [B, 3, H_px, W_px]
-                        mask_t = train_mask.unsqueeze(1).float()  # [B, 1, H_lat, W_lat] for interpolation
-                        mask_px = F.interpolate(
-                            mask_t,
-                            size=pred_pixels.shape[-2:],
-                            mode='nearest',
-                        )  # [B, 1, H_px, W_px]
-                        m = mask_px[:, 0]  # [B, H_px, W_px]
-                        B = m.shape[0]
-                        rows_any = (m > 0.5).any(dim=2)  # [B, H_px]
-                        cols_any = (m > 0.5).any(dim=1)  # [B, W_px]
-                        # Cumsum trick: first/last nonzero index per sample
-                        rows_cs = rows_any.cumsum(dim=1)
-                        rows_cs_rev = rows_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
-                        cols_cs = cols_any.cumsum(dim=1)
-                        cols_cs_rev = cols_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
-                        has_mask = rows_any.any(dim=1) & cols_any.any(dim=1)
-                        y1 = ((rows_cs == 1) & rows_any).int().argmax(dim=1)
-                        y2 = ((rows_cs_rev == 1) & rows_any).int().argmax(dim=1) + 1
-                        x1 = ((cols_cs == 1) & cols_any).int().argmax(dim=1)
-                        x2 = ((cols_cs_rev == 1) & cols_any).int().argmax(dim=1) + 1
-                        no_mask = ~has_mask
-                        if no_mask.any():
-                            y1[no_mask] = 0
-                            y2[no_mask] = pred_pixels.shape[2]
-                            x1[no_mask] = 0
-                            x2[no_mask] = pred_pixels.shape[3]
-                        fd_pixels = torch.stack([
-                            pred_pixels[b, :, y1[b]:y2[b], x1[b]:x2[b]]
-                            for b in range(B)
-                        ], dim=0)
-                    else:
-                        # Full-res mode: use the whole image as-is
-                        fd_pixels = pred_pixels
-
-                    # Compute FD-Loss (gradient-preserving) on crop-only pixels
-                    fd_loss, fd_dict = fd_manager.compute_loss(fd_pixels)
-
-                    # Add FD-Loss to total loss (weighted)
-                    fd_weight = getattr(t, 'fd_loss_weight', 0.1)
-                    loss = loss + fd_weight * fd_loss
-
-                    # Enqueue features for next step (detached, no grad) — crop-only
-                    # source_type=1 marks these as machine-generated
-                    # During warmup (pbar.n < fd_warmup_steps), we skip enqueuing
-                    # generated features to prevent early noisy outputs from
-                    # polluting the reference distribution.  FD-Loss is still
-                    # computed against the pre-filled real data.
-                    if fd_warmup_steps <= 0 or pbar.n >= fd_warmup_steps:
-                        fd_manager.enqueue_features(fd_pixels, source_images=fd_pixels, source_type=1)
-                    elif pbar.n == 0:
-                        t.a.print(f"  FD warmup: skipping generated feature enqueue for first {fd_warmup_steps} steps")
-
-                    # Log FID values
-                    _fd_str = ", ".join([f"{k}={v:.2f}" for k, v in fd_dict.items()])
-
-                    # Periodic cluster logging for inter-epoch inspection
-                    if _fd_cluster_step > 0 and pbar.n > 0 and pbar.n % _fd_cluster_step == 0:
-                        try:
-                            _html = fd_manager.get_cluster_summary_html()
-                            t.a.print(f"\n[Step {pbar.n}] FD queue clusters:\n{_html}")
-                        except Exception:
-                            pass
-                else:
-                    _fd_str = ""
-                # -----------------------------------------------------------------
-
-                # --- Pause-and-inspect: wait for user guidance at configurable intervals ---
-                if _fd_pause_interval > 0 and pbar.n > 0 and pbar.n % _fd_pause_interval == 0:
-                    _fd_pause_step = pbar.n
-                    _fd_paused = True
-                    _fd_resume_signal = False
-                    t.a.print(f"\n[Step {pbar.n}] ⏸️  Training paused for cluster inspection. "
-                              "Switch to the 'FD Cluster Inspector' tab, review clusters, "
-                              "then click 'Resume Training' to continue.")
-                    # Busy-wait until the UI signals resume
-                    import time as _time
-                    while _fd_paused and not _fd_resume_signal:
-                        _time.sleep(0.5)
-                        # Also check if user requested a full stop
-                        if stoptimer > 0:
-                            break
-                    _fd_last_pause_step = _fd_pause_step
-                    _fd_paused = False
-                    _fd_pause_step = 0
-                    t.a.print(f"[Step {pbar.n}] ▶️  Resuming training.")
-                # -----------------------------------------------------------------
-
                 c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
                 _mode_tag = f"/{t.hybrid_processing_mode}" if _train_hybrid and hasattr(t, 'hybrid_processing_mode') else ""
-                _fd_tag = f" FD: {_fd_str}" if _fd_str else ""
                 pbar.set_description(
                     f"Loss EMA * 1000: {loss_ema * 1000:.4f}, LR: " + ", ".join(c_lrs) +
-                    f", TS: {ts_lo}-{ts_hi}{_mode_tag}{_fd_tag}, Epoch: {t.dataloader.epoch}"
+                    f", TS: {ts_lo}-{ts_hi}{_mode_tag}, Epoch: {t.dataloader.epoch}"
                 )
                 pbar.update(1)
 
@@ -618,7 +414,6 @@ def train_lora(t):
 
 def train_diff2(t):
     global stoptimer
-    global _fd_pause_interval, _fd_paused, _fd_resume_signal, _fd_pause_step, _fd_last_pause_step
     stoptimer = 0
 
     if t.mode == "ADDifT":
@@ -639,72 +434,7 @@ def train_diff2(t):
     if not t.dataloader.data:
         return "No data!"
 
-    # --- FD-Loss setup -------------------------------------------------------
-    _use_fd_loss = getattr(t, 'fd_loss_enable', False)
-    fd_manager = None
-    if _use_fd_loss:
-        t.a.print("Initializing FD-Loss...")
-        fd_repr_models = getattr(t, 'fd_repr_models', 'dinov2_vitb14').strip()
-        fd_repr_models = [m.strip() for m in fd_repr_models.split(",") if m.strip()]
-        fd_queue_size = getattr(t, 'fd_queue_size', 50000)
-        fd_queue_mode = getattr(t, 'fd_queue_mode', 'online_accum')
-        fd_ema_beta = getattr(t, 'fd_ema_beta', 0.9999)
-        fd_weight = getattr(t, 'fd_loss_weight', 0.1)
-        fd_fid_norm_eps = getattr(t, 'fd_fid_norm_eps', 1e-6)
-        # --- New: intelligent queue management parameters ---
-        fd_eviction_mode = getattr(t, 'fd_eviction_mode', 'fifo')
-        fd_guidance_strength = getattr(t, 'fd_guidance_strength', 0.5)
-        fd_n_clusters = getattr(t, 'fd_n_clusters', 20)
-        fd_cluster_log_interval = getattr(t, 'fd_cluster_log_interval', 0)  # 0 = disabled
-        fd_store_source_images = getattr(t, 'fd_store_source_images', False)
-        fd_enqueue_generated = getattr(t, 'fd_enqueue_generated', True)
-        fd_pause_interval = getattr(t, 'fd_pause_interval', 0)  # 0 = disabled
-        # Warmup: skip enqueuing generated features for the first N training steps.
-        fd_warmup_steps = getattr(t, 'fd_warmup_steps', 0)  # 0 = disabled
-        # ----------------------------------------------------
-        # Set pause interval on module-level variable for UI access
-        _fd_pause_interval = fd_pause_interval
-
-        fd_manager = FDLossManager(
-            repr_models=fd_repr_models,
-            queue_size=fd_queue_size,
-            queue_mode=fd_queue_mode,
-            ema_beta=fd_ema_beta,
-            weights=[fd_weight] * len(fd_repr_models),
-            fid_norm_eps=fd_fid_norm_eps,
-            device=CUDA,
-            # --- New ---
-            eviction_mode=fd_eviction_mode,
-            guidance_strength=fd_guidance_strength,
-            n_clusters=fd_n_clusters,
-            store_source_images=fd_store_source_images,
-            enqueue_generated=fd_enqueue_generated,
-        )
-        t.a.print(f"  FD-Loss judges: {fd_repr_models}, queue_size={fd_queue_size}, mode={fd_queue_mode}, eviction={fd_eviction_mode}")
-
-        # Pre-fill queues with real data so the covariance estimate is
-        # non-degenerate from step 1 (avoids eigendecomposition failures).
-        # In texture mode, pass mask_key="mask" so only the crop region is
-        # enqueued — the frequency-matched noise background is excluded.
-        _pf_mask_key = "mask" if getattr(t, 'texture_mode', False) else None
-        t.a.print("  Pre-filling FD-Loss queues with training data...")
-        fd_manager.prefill_from_dataloader(t.dataloader, t.vae, mask_key=_pf_mask_key)
-        t.a.print("  FD-Loss queues pre-filled.")
-
-        # Log initial cluster structure if interval is set
-        _fd_cluster_step = fd_cluster_log_interval
-        if _fd_cluster_step > 0:
-            try:
-                _html = fd_manager.get_cluster_summary_html()
-                t.a.print(f"  Initial queue clusters:\n{_html}")
-            except Exception:
-                pass
-        # Expose to Gradio UI via module-level reference
-        global _fd_manager
-        _fd_manager = fd_manager
-    # -------------------------------------------------------------------------
-
-    if not getattr(t, 'texture_mode', False) and not _use_fd_loss:
+    if not getattr(t, 'texture_mode', False):
         del t.vae
         if "BASE" not in t.network_blocks:
             del t.text_model
@@ -799,104 +529,10 @@ def train_diff2(t):
                 t, targ_noise_pred, orig_noise_pred, timesteps, loss_ema, loss_velocity
             )
 
-            # --- FD-Loss: perceptual quality via differentiable FID ----------
-            if _use_fd_loss and fd_manager is not None:
-                # Reconstruct predicted clean latents from the LoRA-modified prediction
-                # Flow matching: noisy = (1-t)*clean + t*noise
-                # velocity = noise - clean
-                # pred_clean = noisy - ts * velocity
-                ts_norm = timesteps.float() / 1000.0
-                # Use the target (LoRA-modified) prediction for FD-Loss evaluation
-                pred_clean = targ_noisy_latents.float() - ts_norm.view(-1, 1, 1, 1) * targ_noise_pred.float()
-
-                # Decode predicted clean latents to pixels [0, 1]
-                pred_pixels = latent2pixels(t, pred_clean)
-
-                # In texture mode, the batch contains a full canvas with frequency-matched
-                # noise background + a placed crop.  Feed ONLY the crop region to FD-Loss.
-                # The mask (latent-space, [B, H_lat, W_lat]) is non-zero only on the crop.
-                # Vectorised per-sample bounding box via cumsum trick (no Python loop).
-                if "mask" in batch and batch["mask"] is not None:
-                    mask_t = batch["mask"].to(CUDA)  # [B, H_lat, W_lat]
-                    mask_px = F.interpolate(
-                        mask_t.unsqueeze(1).float(),  # [B, 1, H_lat, W_lat]
-                        size=pred_pixels.shape[-2:],
-                        mode='nearest',
-                    )  # [B, 1, H_px, W_px]
-                    m = mask_px[:, 0]  # [B, H_px, W_px]
-                    B = m.shape[0]
-                    rows_any = (m > 0.5).any(dim=2)  # [B, H_px]
-                    cols_any = (m > 0.5).any(dim=1)  # [B, W_px]
-                    rows_cs = rows_any.cumsum(dim=1)
-                    rows_cs_rev = rows_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
-                    cols_cs = cols_any.cumsum(dim=1)
-                    cols_cs_rev = cols_any.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
-                    has_mask = rows_any.any(dim=1) & cols_any.any(dim=1)
-                    y1 = ((rows_cs == 1) & rows_any).int().argmax(dim=1)
-                    y2 = ((rows_cs_rev == 1) & rows_any).int().argmax(dim=1) + 1
-                    x1 = ((cols_cs == 1) & cols_any).int().argmax(dim=1)
-                    x2 = ((cols_cs_rev == 1) & cols_any).int().argmax(dim=1) + 1
-                    no_mask = ~has_mask
-                    if no_mask.any():
-                        y1[no_mask] = 0
-                        y2[no_mask] = pred_pixels.shape[2]
-                        x1[no_mask] = 0
-                        x2[no_mask] = pred_pixels.shape[3]
-                    fd_pixels = torch.stack([
-                        pred_pixels[b, :, y1[b]:y2[b], x1[b]:x2[b]]
-                        for b in range(B)
-                    ], dim=0)
-                else:
-                    fd_pixels = pred_pixels
-
-                # Compute FD-Loss (gradient-preserving) on crop-only pixels
-                fd_loss, fd_dict = fd_manager.compute_loss(fd_pixels)
-
-                # Add FD-Loss to total loss (weighted)
-                fd_weight = getattr(t, 'fd_loss_weight', 0.1)
-                loss = loss + fd_weight * fd_loss
-
-                # Enqueue features for next step (detached, no grad) — crop-only
-                # source_type=1 marks these as machine-generated
-                # During warmup (pbar.n < fd_warmup_steps), skip enqueuing
-                # generated features to prevent early noisy outputs from
-                # polluting the reference distribution.
-                if fd_warmup_steps <= 0 or pbar.n >= fd_warmup_steps:
-                    fd_manager.enqueue_features(fd_pixels, source_images=fd_pixels, source_type=1)
-                elif pbar.n == 0:
-                    t.a.print(f"  FD warmup: skipping generated feature enqueue for first {fd_warmup_steps} steps")
-
-                _fd_str = ", ".join([f"{k}={v:.2f}" for k, v in fd_dict.items()])
-            else:
-                _fd_str = ""
-            # -----------------------------------------------------------------
-
-            # --- Pause-and-inspect: wait for user guidance at configurable intervals ---
-            if _fd_pause_interval > 0 and pbar.n > 0 and pbar.n % _fd_pause_interval == 0:
-                _fd_pause_step = pbar.n
-                _fd_paused = True
-                _fd_resume_signal = False
-                t.a.print(f"\n[Step {pbar.n}] ⏸️  Training paused for cluster inspection. "
-                          "Switch to the 'FD Cluster Inspector' tab, review clusters, "
-                          "then click 'Resume Training' to continue.")
-                # Busy-wait until the UI signals resume
-                import time as _time
-                while _fd_paused and not _fd_resume_signal:
-                    _time.sleep(0.5)
-                    # Also check if user requested a full stop
-                    if stoptimer > 0:
-                        break
-                _fd_last_pause_step = _fd_pause_step
-                _fd_paused = False
-                _fd_pause_step = 0
-                t.a.print(f"[Step {pbar.n}] ▶️  Resuming training.")
-            # -----------------------------------------------------------------
-
             c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
-            _fd_tag = f" FD: {_fd_str}" if _fd_str else ""
             pbar.set_description(
                 f"Loss EMA * 1000: {loss_ema * 1000:.4f}, Loss Velocity: {loss_velocity * 1000:.4f}, "
-                f"Current LR: " + ", ".join(c_lrs) + f", Epoch: {epoch}{_fd_tag}"
+                f"Current LR: " + ", ".join(c_lrs) + f", Epoch: {epoch}"
             )
             pbar.update(1)
 
@@ -1103,7 +739,11 @@ class DummyScheduler:
 
 def load_network(t):
     # Anima DiT uses standard linear LoRA (lierla) — no convolutions, no loha
-    return LoRANetwork(t).to(CUDA, dtype=t.train_lora_precision)
+    # Cast to train_model_precision (e.g. bf16) so LoRA weights match the model dtype.
+    # Using train_lora_precision (default fp32) causes a dtype mismatch when the model
+    # runs under bf16 autocast: LoRA-patched layers return fp32 while adaln_lora_B_T_3D
+    # from the timestep embedder is bf16, leading to RuntimeError at the + operator.
+    return LoRANetwork(t).to(CUDA, dtype=t.train_model_precision)
 
 
 def stop_time(save):
@@ -1210,26 +850,6 @@ def image2latent(t, image):
     return latent
 
 
-def latent2pixels(t, latent):
-    """Decode VAE latents back to pixel space [0, 1] for FD-Loss feature extraction.
-
-    Gradients flow through the VAE decode (VAE is frozen, so this is safe).
-    The VAE's decode_to_pixels handles the latent normalization internally.
-
-    Args:
-        t: Trainer instance with .vae attribute.
-        latent: Tensor [B, C, H, W] in VAE latent space.
-
-    Returns:
-        Tensor [B, 3, H*8, W*8] in [0, 1] range.
-    """
-    # decode_to_pixels expects [B, C, H, W] or [B, C, 1, H, W]
-    # Returns [-1, 1] range. VAE is frozen so gradients pass through safely.
-    pixels = t.vae.decode_to_pixels(latent.float())
-    # [-1, 1] -> [0, 1] for FD-Loss feature extractors (expect [0, 1] input)
-    return pixels * 0.5 + 0.5
-
-
 def text2cond(t, prompt):
     """Encode a text prompt into Anima conditioning tensors."""
     cond, _ = t.text_model.encode_text(prompt if isinstance(prompt, list) else [prompt])
@@ -1290,211 +910,3 @@ def metadator(t):
         "ss_tag_frequency": json.dumps({1: t.count_dict}),
     }
 
-# --------------------------------------------------------------------------- #
-# Gradio UI accessors for the interactive cluster panel                        #
-# These are called from scripts/traintrain.py while training is running.       #
-# --------------------------------------------------------------------------- #
-
-def get_fd_manager():
-    """Return the active FDLossManager instance, or None if FD-Loss is off."""
-    return _fd_manager
-
-
-def render_cluster_panel_ui(n_clusters: Optional[int] = None,
-                            max_per_cluster: int = 9) -> str:
-    """Render the interactive cluster panel HTML for the Gradio UI.
-
-    Called from the UI refresh button.  Returns an HTML string or a
-    placeholder message if FD-Loss is not active.
-    """
-    fd = _fd_manager
-    if fd is None:
-        return ("<div style='color:#888;font-family:sans-serif;font-size:13px;'>"
-                "FD-Loss is not enabled.  Check <b>fd_loss_enable</b> and start training.</div>")
-    try:
-        return fd.render_interactive_cluster_panel(
-            n_clusters=n_clusters,
-            max_per_cluster=max_per_cluster,
-        )
-    except Exception as e:
-        return (f"<div style='color:#f88;font-family:sans-serif;font-size:13px;'>"
-                f"Error rendering cluster panel: {e}</div>")
-
-
-def fetch_thumbnail_base64(queue_idx: int) -> str:
-    """Return a base64-encoded PNG data URI for a single queue index.
-
-    Called on-demand from the JS lazy thumbnail loader when the user
-    expands a cluster accordion.  Only the requested thumbnail is
-    base64-encoded, avoiding the cost of encoding all thumbnails at once.
-    """
-    fd = _fd_manager
-    if fd is None:
-        return ""
-    try:
-        return fd.fetch_thumbnail_base64(queue_idx)
-    except Exception:
-        return ""
-
-
-def cluster_panel_toggle_protect_cluster(cluster_id: int) -> str:
-    """Stage a protect/unprotect cluster action.  Returns updated panel HTML."""
-    fd = _fd_manager
-    if fd is None:
-        return "<div style='color:#888;'>FD-Loss not active</div>"
-    try:
-        # Determine current projected state using LIVE clustering.
-        # Cluster-level actions are resolved to per-index actions at stage time
-        # (see FDLossManager.protect_cluster), so we use live clustering here
-        # to determine the correct toggle direction.
-        queue = fd.judges[0]["queue"]
-        projected = fd._get_projected_protected_mask(queue)
-        clusters = queue.get_clusters(n_clusters=fd.n_clusters)
-        if not clusters or "assignments" not in clusters:
-            return fd.render_interactive_cluster_panel()
-        indices = (clusters["assignments"] == cluster_id).nonzero(as_tuple=True)[0]
-        if indices.numel() == 0:
-            return fd.render_interactive_cluster_panel()
-        if projected[indices].any():
-            fd.unprotect_cluster(cluster_id)
-        else:
-            fd.protect_cluster(cluster_id)
-        return fd.render_interactive_cluster_panel()
-    except Exception as e:
-        return f"<div style='color:#f88;'>Error: {e}</div>"
-
-
-def cluster_panel_set_guidance(cluster_id: int) -> str:
-    """Stage a set-guidance action.  Returns updated panel HTML."""
-    fd = _fd_manager
-    if fd is None:
-        return "<div style='color:#888;'>FD-Loss not active</div>"
-    try:
-        fd.set_guidance_from_cluster(cluster_id)
-        return fd.render_interactive_cluster_panel()
-    except Exception as e:
-        return f"<div style='color:#f88;'>Error: {e}</div>"
-
-
-def cluster_panel_clear_guidance() -> str:
-    """Stage a clear-guidance action.  Returns updated panel HTML."""
-    fd = _fd_manager
-    if fd is None:
-        return "<div style='color:#888;'>FD-Loss not active</div>"
-    try:
-        fd.clear_guidance_target()
-        return fd.render_interactive_cluster_panel()
-    except Exception as e:
-        return f"<div style='color:#f88;'>Error: {e}</div>"
-
-
-def cluster_panel_toggle_evict_cluster(cluster_id: int) -> str:
-    """Stage a toggle-eviction cluster action.  Returns updated panel HTML."""
-    fd = _fd_manager
-    if fd is None:
-        return "<div style='color:#888;'>FD-Loss not active</div>"
-    try:
-        fd.evict_cluster(cluster_id)
-        return fd.render_interactive_cluster_panel()
-    except Exception as e:
-        return f"<div style='color:#f88;'>Error: {e}</div>"
-
-
-def cluster_panel_toggle_protect_index(idx: int) -> str:
-    """Stage a protect/unprotect index action.  Returns updated panel HTML."""
-    fd = _fd_manager
-    if fd is None:
-        return "<div style='color:#888;'>FD-Loss not active</div>"
-    try:
-        # Determine current projected state
-        queue = fd.judges[0]["queue"]
-        projected = fd._get_projected_protected_mask(queue)
-        if projected[idx].item():
-            fd.unprotect_index(idx)
-        else:
-            fd.protect_index(idx)
-        return fd.render_interactive_cluster_panel()
-    except Exception as e:
-        return f"<div style='color:#f88;'>Error: {e}</div>"
-
-
-# --------------------------------------------------------------------------- #
-# Pause-and-inspect UI accessors                                               #
-# --------------------------------------------------------------------------- #
-
-def set_fd_pause_interval(interval: int):
-    """Set the pause interval (steps between pauses).  0 = disabled."""
-    global _fd_pause_interval
-    _fd_pause_interval = interval
-
-
-def get_fd_pause_interval() -> int:
-    """Return the current pause interval."""
-    return _fd_pause_interval
-
-
-def resume_training() -> str:
-    """Signal the training loop to resume from a pause.
-
-    Returns a status message for the UI.
-    """
-    global _fd_resume_signal, _fd_paused, _fd_just_resumed
-    if not _fd_paused:
-        return "<div style='color:#888;'>Training is not paused.</div>"
-    _fd_resume_signal = True
-    _fd_just_resumed = True
-    return "<div style='color:#4ade80;'>▶️ Resume signal sent.</div>"
-
-
-def is_training_paused() -> bool:
-    """Return True if training is currently paused for inspection."""
-    return _fd_paused
-
-
-def get_pause_status_html() -> str:
-    """Return an HTML snippet showing the current pause state."""
-    global _fd_just_resumed, _fd_last_pause_step
-    if _fd_just_resumed:
-        _fd_just_resumed = False  # consume the flag
-        return ("<div style='padding:8px 12px;background:#1a2a1a;border:1px solid #4ade80;"
-                "border-radius:4px;font-family:sans-serif;font-size:13px;color:#4ade80;'>"
-                "▶️ <b>Training Resumed</b> — continuing from step "
-                f"<b>{_fd_last_pause_step}</b>.</div>")
-    if _fd_paused:
-        return ("<div style='padding:8px 12px;background:#1a2a1a;border:1px solid #4ade80;"
-                "border-radius:4px;font-family:sans-serif;font-size:13px;color:#4ade80;'>"
-                "⏸️ <b>Training Paused</b> at step "
-                f"<b>{_fd_pause_step}</b>.  Inspect clusters, perform guidance, "
-                "then click <b>Resume Training</b>.</div>")
-    if _fd_pause_interval > 0:
-        return ("<div style='padding:8px 12px;background:#1a1a2a;border:1px solid #60a5fa;"
-                "border-radius:4px;font-family:sans-serif;font-size:13px;color:#60a5fa;'>"
-                f"ℹ️ Pause-and-inspect is active (every <b>{_fd_pause_interval}</b> steps). "
-                "Training will pause automatically at the next interval.</div>")
-    return ("<div style='padding:8px 12px;background:#1a1a1a;border:1px solid #555;"
-            "border-radius:4px;font-family:sans-serif;font-size:13px;color:#888;'>"
-            "Pause-and-inspect is disabled.  Set <b>fd_pause_interval</b> > 0 to enable.</div>")
-
-
-def cluster_panel_toggle_evict_index(idx: int) -> str:
-    """Stage a toggle-eviction index action.  Returns updated panel HTML."""
-    fd = _fd_manager
-    if fd is None:
-        return "<div style='color:#888;'>FD-Loss not active</div>"
-    try:
-        fd.evict_index(idx)
-        return fd.render_interactive_cluster_panel()
-    except Exception as e:
-        return f"<div style='color:#f88;'>Error: {e}</div>"
-
-
-def cluster_panel_commit_all() -> str:
-    """Execute all staged actions (protect/guidance/evict) and return updated panel HTML."""
-    fd = _fd_manager
-    if fd is None:
-        return "<div style='color:#888;'>FD-Loss not active</div>"
-    try:
-        n = fd.commit_pending_actions()
-        return fd.render_interactive_cluster_panel()
-    except Exception as e:
-        return f"<div style='color:#f88;'>Error: {e}</div>"

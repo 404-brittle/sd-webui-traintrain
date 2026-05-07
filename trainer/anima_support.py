@@ -1,15 +1,7 @@
 """Anima-specific support for traintrain: flow matching, forward pass, text encoding."""
 
-import os
-import sys
 import torch
 import torch.nn as nn
-
-# Add sd-scripts root to path so we can import library.*
-_TRAINTRAIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SD_SCRIPTS_ROOT = os.environ.get("SD_SCRIPTS_PATH") or os.path.dirname(_TRAINTRAIN_DIR)
-if _SD_SCRIPTS_ROOT not in sys.path:
-    sys.path.insert(0, _SD_SCRIPTS_ROOT)
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +22,13 @@ class AnimaFlowScheduler:
         """
         t = timesteps.float() / 1000.0
         t = t.view(-1, *([1] * (clean_latents.dim() - 1)))
-        return (1.0 - t) * clean_latents + t * noise
+        # Cast result back to clean_latents dtype to avoid float32 promotion
+        # from the (1.0 - t) * clean_latents multiplication when clean_latents
+        # is bf16. Without this, noisy_latents becomes float32, which then
+        # causes a dtype mismatch inside Block._forward where
+        # torch.autocast(enabled=False) disables autocast, so
+        # F.linear(float32_input, bf16_weight) fails.
+        return ((1.0 - t) * clean_latents + t * noise).to(dtype=clean_latents.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +120,7 @@ def anima_forward(t, noisy_latents: torch.Tensor, timesteps: torch.Tensor, conds
         cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
 
     x_5d = noisy_latents.unsqueeze(2)             # [B, C, 1, H, W]
-    timesteps_01 = timesteps.float() / 1000.0     # [B] in [0, 1]
+    timesteps_01 = (timesteps.float() / 1000.0).to(dtype=noisy_latents.dtype)  # [B] in [0, 1], match latent dtype
 
     B, _, H, W = noisy_latents.shape
     padding_mask = torch.zeros(B, 1, H, W, dtype=noisy_latents.dtype, device=noisy_latents.device)

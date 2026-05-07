@@ -20,7 +20,6 @@
     <!-- Control tabs -->
     <div class="tab-bar">
       <button class="tab-btn active" data-tab="train">Train</button>
-      <button class="tab-btn" data-tab="fd-cluster">FD Cluster Inspector</button>
     </div>
 
     <!-- ===================== TRAIN TAB ===================== -->
@@ -92,12 +91,6 @@
         <div class="section-grid cols-3" id="bucket-params"></div>
       </details>
 
-      <!-- ===== FD-Loss Parameters ===== -->
-      <details class="section" open>
-        <summary class="section-title">FD-Loss</summary>
-        <div class="section-grid cols-3" id="fd-params"></div>
-      </details>
-
       <!-- ===== Other Options ===== -->
       <details class="section" open>
         <summary class="section-title">Other Options</summary>
@@ -166,34 +159,6 @@
       </details>
     </div>
 
-    <!-- ===================== FD CLUSTER TAB ===================== -->
-    <div id="tab-fd-cluster" class="tab-content">
-      <div class="fd-header">
-        <p class="fd-desc">Interactive cluster panel for FD-Loss feature queues. Start training with <strong>fd_loss_enable</strong> checked, then click <strong>Refresh</strong> to inspect clusters.</p>
-      </div>
-      <div id="fd-active-count" class="fd-active-count" style="display:none;margin-bottom:6px;padding:4px 10px;background:rgba(96,165,250,0.06);border:1px solid rgba(96,165,250,0.2);border-radius:3px;font-size:12px;color:#93c5fd;"></div>
-      <div id="fd-pause-status" class="fd-pause-status"></div>
-      <div class="fd-controls">
-        <button id="fd-resume-btn" class="btn btn-primary" type="button">▶️ Resume Training</button>
-        <button id="fd-refresh-btn" class="btn btn-secondary" type="button">🔄 Refresh Cluster Panel</button>
-        <div class="field-group">
-          <label for="fd-n-clusters">Clusters</label>
-          <input type="number" id="fd-n-clusters" class="form-input" value="20" min="2" max="200" step="1" autocomplete="off">
-        </div>
-        <div class="field-group">
-          <label for="fd-max-thumbs">Thumbnails per cluster</label>
-          <input type="number" id="fd-max-thumbs" class="form-input" value="9" min="1" max="50" step="1" autocomplete="off">
-        </div>
-        <div class="field-group">
-          <label for="fd-thumb-scale">Thumbnail scale</label>
-          <input type="range" id="fd-thumb-scale" min="0.5" max="3.0" step="0.1" value="1.0">
-          <span class="slider-val" id="fd-thumb-scale-val">1.0</span>
-        </div>
-      </div>
-      <div id="fd-cluster-html" class="fd-cluster-container">
-        <div class="fd-placeholder">FD-Loss not active. Enable <strong>fd_loss_enable</strong> and start training.</div>
-      </div>
-    </div>
   </div>
 
   <script src="app.js"></script>

@@ -2,16 +2,6 @@
 setlocal
 
 set VENV_DIR=.venv
-set SD_SCRIPTS_PATH=X:\SD\sd-scripts
-
-:: Path to the Anima sd-scripts repo containing the 'library' folder.
-:: Override by setting SD_SCRIPTS_PATH before running, e.g.:
-::   set SD_SCRIPTS_PATH=X:\SD\sd-scripts && launch.bat
-if "%SD_SCRIPTS_PATH%"=="" (
-    echo WARNING: SD_SCRIPTS_PATH is not set. Set it to the sd-scripts repo path, e.g.:
-    echo   set SD_SCRIPTS_PATH=X:\SD\sd-scripts
-    echo.
-)
 
 :: Optional: set port (default 7861)
 if "%TRAINTRAIN_PORT%"=="" set TRAINTRAIN_PORT=7861

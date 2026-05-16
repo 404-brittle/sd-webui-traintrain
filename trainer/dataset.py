@@ -261,8 +261,8 @@ class LatentsConds(Dataset):
                 _, image, mask, emb1, emb2, canvas_hw, tile_res, tile_scale = item
 
                 _TEXTURE_CANVAS_PRESETS = [
-                    #(640, 1536), (1536, 640),
-                    #(832, 1216), (1216, 832),
+                    (640, 1536), (1536, 640),
+                    (832, 1216), (1216, 832),
                     (1024, 1024), (1024, 1024), #twice, for 1/3 chance.
                 ]
 

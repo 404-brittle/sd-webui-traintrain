@@ -3,3 +3,6 @@
 *.pyc
 *.txt
 !requirements.txt
+jsons
+output
+output_cnet

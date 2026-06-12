@@ -14,6 +14,7 @@ from torch.nn import ModuleList
 from tqdm import tqdm
 from trainer.lora import LoRANetwork, LycorisNetwork
 from trainer import trainer, dataset
+from trainer.loss_components import build_composite_loss
 from trainer.anima_support import (
     AnimaFlowScheduler,
     AnimaTextModel,
@@ -788,13 +789,35 @@ def makesavelist(t):
 
 def process_loss(t, original, target, timesteps, loss_ema, loss_velocity,
                  mask=None, copy=False, ts_weights=None):
-    if t.train_loss_function == "MSE":
+    # ------------------------------------------------------------------ #
+    # Composite loss path (train_loss_function == "composite")
+    # ------------------------------------------------------------------ #
+    if t.train_loss_function == "composite":
+        # Build + cache the composite loss on first call
+        if not hasattr(t, "_composite_loss") or t._composite_loss is None:
+            spec = getattr(t, "train_loss_components", "") or ""
+            t._composite_loss = build_composite_loss(
+                spec,
+                device=original.device,
+                latent_channels=original.shape[1],
+            )
+        loss = t._composite_loss(
+            original.float(), target.float(),
+            timesteps=timesteps, latents=target,
+            step=getattr(t, "_step", 0), t=t,
+        )
+        # loss is [B, C, H, W] — continues to mask / spatial reduction below
+    # ------------------------------------------------------------------ #
+    # Legacy loss path (MSE / L1 / Smooth-L1 — backward compat)
+    # ------------------------------------------------------------------ #
+    elif t.train_loss_function == "MSE":
         loss = torch.nn.functional.mse_loss(original.float(), target.float(), reduction="none")
     elif t.train_loss_function == "L1":
         loss = torch.nn.functional.l1_loss(original.float(), target.float(), reduction="none")
     elif t.train_loss_function == "Smooth-L1":
         loss = torch.nn.functional.smooth_l1_loss(original.float(), target.float(), reduction="none")
     else:
+        # Fallback: plain MSE
         loss = torch.nn.functional.mse_loss(original.float(), target.float(), reduction="none")
 
     if mask is not None:

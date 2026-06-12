@@ -79,120 +79,52 @@ def _squeeze_cond(cond):
     return cond
 
 
-def _freq_matched_background(tile: torch.Tensor, canvas_h: int, canvas_w: int) -> torch.Tensor:
-    """Generate a canvas-sized background whose power spectrum matches `tile` but with
-    completely randomised spatial phase.
-
-    The tile has real spatial structure (correlated adjacent latent pixels).  Plain
-    i.i.d. N(μ,σ²) noise has no such correlations.  At intermediate timesteps (~300–700)
-    the model can detect the "correlated region vs. uncorrelated region" boundary in the
-    forward-pass input even though the loss mask zeroes it out, causing boundary/tiling
-    artefacts in the trained LoRA.
-
-    By matching the power spectrum we make the background statistically indistinguishable
-    from texture content: same spatial frequency distribution, different specific content
-    every call.  The model's attention cannot consistently find a boundary.
-
-    Concretely: take the per-channel 2-D FFT of the tile, resample the magnitude spectrum
-    to canvas size, multiply by a fresh unit-complex random phase, then IFFT.
-    """
-    C = tile.shape[0]
-
-    # Per-channel FFT of the tile (real-to-complex)
-    tile_fft = torch.fft.rfft2(tile.float())           # [C, th, tw//2+1]  complex
-    tile_mag = tile_fft.abs()                          # [C, th, tw//2+1]  real
-
-    # Resample tile magnitude spectrum to canvas FFT dimensions
-    tile_mag_resized = F.interpolate(
-        tile_mag.unsqueeze(0),                         # [1, C, th, tw//2+1]
-        size=(canvas_h, canvas_w // 2 + 1),
-        mode='bilinear', align_corners=False,
-    ).squeeze(0)                                       # [C, canvas_h, canvas_w//2+1]
-
-    # Random unit-complex phase (fresh every call) — on same device as tile
-    rand_angle = torch.rand(C, canvas_h, canvas_w // 2 + 1, device=tile_mag_resized.device) * (2 * math.pi)
-    rand_phase = torch.polar(torch.ones_like(rand_angle), rand_angle)  # unit complex
-
-    # Apply magnitude from tile, random phase
-    result_fft = tile_mag_resized * rand_phase
-    result = torch.fft.irfft2(result_fft, s=(canvas_h, canvas_w))      # [C, H, W]
-
-    return result.to(tile.dtype)
-
-
-def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px: int,
+def _place_texture_crop(canvas_latent: torch.Tensor, feather_px: int,
                         alpha_crop: torch.Tensor | None = None,
                         tile_px: int | None = None):
-    """Place a square tile from the (pre-scaled) image latent at a random position on a
-    canvas whose background is filled with frequency-matched noise, and return a feathered
-    mask that is non-zero only over the tile region.
+    """Use a full-canvas latent directly — no synthetic background.
 
-    Background fill uses _freq_matched_background: noise with the tile's power spectrum
-    but randomised spatial phase.  This makes the background statistically
-    indistinguishable from real texture content — same spatial correlation structure,
-    different specific values every call.  Plain N(μ,σ²) noise lacks spatial correlations
-    and creates a detectable "correlated vs. uncorrelated" boundary in the forward pass at
-    intermediate timesteps (~300–700), even though the loss mask zeroes it out, leading to
-    boundary/tiling artefacts in the trained LoRA.  Frequency-matched noise eliminates
-    this boundary at all timestep levels, allowing the full 0–1000 range without
-    positional or boundary leakage.
+    The canvas is a real latent (encoded from a canvas-sized image crop).
+    A random sub-region within the canvas is selected and a feathered mask is
+    created over it.  The canvas content is never modified — the background
+    surrounding the masked region is real texture from the same source image,
+    so there is no "real vs. synthetic" boundary for the model to detect.
 
-    The mask remains zero outside the tile: the background has no learnable target, so
-    including it in the loss would only add gradient variance.
+    At intermediate timesteps (~300–700) the model's UNet processes the full
+    spatial canvas through attention layers.  Having real texture everywhere
+    (not tile-on-synthetic-noise) provides natural context and eliminates
+    boundary/tiling artefacts.
 
-    Both the source position within the image latent and (when tile_px is None) tile size
-    are re-sampled every call, giving positional/scale variance across DataLoader draws.
+    The mask remains zero outside the tile region: the background has no
+    learnable target, so including it in the loss would only add gradient
+    variance.  But it *does* condition the forward pass, which is beneficial.
 
     Args:
-        crop_latent: encoded latent of the (already tile-scaled) image, any size.
-        canvas_hw:   (H, W) in pixels of the training canvas.
-        feather_px:  cosine feather width in latent pixels.
-        alpha_crop:  optional [img_lat_h, img_lat_w] float tensor (0-1) aligned with
-                     the full image latent. Multiplied into the feathered patch.
-        tile_px:     if given, the fixed square tile side in *pixels* (divided by 8
-                     for latent space). The tile is clamped to the image latent size
-                     when the image is smaller. When None, tile size is random.
+        canvas_latent: encoded latent of the full canvas ``[C, H, W]``
+                       (all real texture, from a larger image crop).
+        feather_px:    cosine feather width in latent pixels.
+        alpha_crop:    optional alpha/attention mask ``[H, W]`` in (0, 1)
+                       multiplied into the feathered patch.
+        tile_px:       **Deprecated** (unused).  Kept for signature compat
+                       with the pre-encoded non-JIT path.
 
     Returns:
-        canvas  — [1, C, canvas_lat_h, canvas_lat_w]  float tensor
-        mask    — [1, canvas_lat_h, canvas_lat_w]      float tensor in [0, 1]
+        canvas  — ``[1, C, H, W]``  same as input (unchanged)
+        mask    — ``[1, H, W]``      feathered mask in [0, 1]
     """
-    canvas_h, canvas_w = canvas_hw
-    clat_h, clat_w = canvas_h // 8, canvas_w // 8
+    C, H, W = canvas_latent.shape
 
-    crop = crop_latent.squeeze(0)          # [C, img_h, img_w]
-    _, ih, iw = crop.shape
+    # Random sub-region tile: 50-100% of canvas for positional variance.
+    # Varying the mask position prevents the model from associating
+    # "learned content" with a fixed spatial location on the canvas.
+    tile_ratio = random.uniform(0.5, 1.0)
+    th = max(4, int(H * tile_ratio))
+    tw = max(4, int(W * tile_ratio))
 
-    # --- Determine square tile size in latent space ---
-    if tile_px is not None:
-        # Fixed tile: convert pixels → latent units, clamp to what fits in both
-        # the (scaled) image latent and the canvas latent.
-        tile_lat = max(1, tile_px // 8)
-        th = tw = min(tile_lat, ih, iw, clat_h, clat_w)
-    else:
-        # Random tile: uniform in [max/4, max] where max fits both image and canvas.
-        max_tile = min(ih, iw, clat_h, clat_w)
-        min_tile = max(1, max_tile // 4)
-        th = tw = random.randint(min_tile, max_tile)
+    oy = random.randint(0, H - th)
+    ox = random.randint(0, W - tw)
 
-    # Random source position within the image latent
-    src_y = random.randint(0, ih - th)
-    src_x = random.randint(0, iw - tw)
-    tile = crop[:, src_y:src_y + th, src_x:src_x + tw]   # [C, th, tw]
-
-    # --- Random destination position within the canvas ---
-    max_oy = clat_h - th
-    max_ox = clat_w - tw
-    oy = random.randint(0, max_oy)
-    ox = random.randint(0, max_ox)
-
-    # Fill background with frequency-matched noise: same power spectrum as the tile
-    # but randomised spatial phase, so the background looks like texture-like content
-    # with no consistent boundary the model can detect or memorise.
-    canvas = _freq_matched_background(tile, clat_h, clat_w)
-    canvas[:, oy:oy + th, ox:ox + tw] = tile
-
-    # Feathered mask: cosine taper over `feather` latent pixels from every edge
+    # Feathered mask: cosine taper over `feather` latent pixels
     feather = min(feather_px, th // 2, tw // 2)
     patch = torch.ones(th, tw)
     for d in range(feather):
@@ -202,19 +134,23 @@ def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px:
         patch[:, d]      *= v   # left edge
         patch[:, tw-1-d] *= v   # right edge
 
-    # Blend in alpha mask (from image alpha channel or external mask file).
-    # alpha_crop is aligned with the full image latent, so crop the same region.
+    # Blend in alpha mask if provided
     if alpha_crop is not None:
-        ac = alpha_crop
-        if ac.shape != (ih, iw):
-            ac = F.interpolate(ac.unsqueeze(0).unsqueeze(0).float(),
-                               size=(ih, iw), mode='bilinear', align_corners=False)[0, 0]
-        patch = patch * ac[src_y:src_y + th, src_x:src_x + tw]
+        # alpha_crop aligns with the full canvas, crop to the tile region
+        if alpha_crop.shape != (H, W):
+            ac = F.interpolate(
+                alpha_crop.unsqueeze(0).unsqueeze(0).float(),
+                size=(H, W), mode='bilinear', align_corners=False,
+            )[0, 0]
+        else:
+            ac = alpha_crop
+        patch = patch * ac[oy:oy + th, ox:ox + tw]
 
-    mask = torch.zeros(1, clat_h, clat_w)
+    mask = torch.zeros(1, H, W)
     mask[0, oy:oy + th, ox:ox + tw] = patch
 
-    return canvas.unsqueeze(0), mask   # [1,C,H,W], [1,H,W]
+    # Canvas is used as-is — no synthetic background, no tile insertion.
+    return canvas_latent.unsqueeze(0), mask   # [1,C,H,W], [1,H,W]
 
 
 class LatentsConds(Dataset):
@@ -297,17 +233,17 @@ class LatentsConds(Dataset):
                     self._current_canvas_hw = random.choice(_TEXTURE_CANVAS_PRESETS)
                 canvas_hw = self._current_canvas_hw
 
-                # JIT: Randomly crop, scale, and encode
-                canvas_h, canvas_w = canvas_hw
-                clat_h, clat_w = canvas_h // 8, canvas_w // 8
-                
-                best_crop = None
-                best_energy = -1
-                best_mask_score = -1.0
+                # ---- New approach: crop a CANVAS-SIZED region from the image ----
+                # and encode it directly.  No synthetic background, no FFT noise.
+                # The full canvas is real texture from the same source image.
+                canvas_w, canvas_h = canvas_hw
 
-                # Pre-compute full-resolution mask as numpy for fast per-crop mean.
-                # Only built when texture_avoid_masked is set; None disables all
-                # mask scoring so the loop runs just once and takes the first crop.
+                # The crop must fit in the source image.
+                max_sx = max(0, image.width - canvas_w)
+                max_sy = max(0, image.height - canvas_h)
+
+                # Use the existing mask/energy scoring loop to pick the best
+                # canvas-sized region (or the first random one when disabled).
                 mask_np_full = None
                 if mask is not None and self.texture_avoid_masked:
                     mask_np_full = np.array(mask.convert("L"), dtype=np.float32) / 255.0
@@ -316,80 +252,63 @@ class LatentsConds(Dataset):
                 use_energy = self.texture_energy_threshold > 0
                 max_attempts = 10 if (has_mask or use_energy) else 1
 
-                best_ms         = -1.0
-                best_energy_val = -1.0
+                best_crop   = None
+                best_ms       = -1.0
+                best_energy   = -1.0
 
                 for attempt in range(max_attempts):
-                    # Resolve tile size in pixels
-                    if tile_res > 0:
-                        tile_px = tile_res
-                    else:
-                        max_tile_lat = min(image.width // 8, image.height // 8, clat_h, clat_w)
-                        if tile_scale > 1.0:
-                            max_tile_lat = min(max_tile_lat, round(image.width * tile_scale) // 8, round(image.height * tile_scale) // 8)
-                        min_tile_lat = max(1, max_tile_lat // 4)
-                        tile_lat = random.randint(min_tile_lat, max_tile_lat)
-                        tile_px = tile_lat * 8
+                    sx = random.randint(0, max_sx)
+                    sy = random.randint(0, max_sy)
 
-                    src_px = max(8, round(tile_px / tile_scale))
-                    src_px = min(src_px, image.width, image.height)
-                    tile_px = round(src_px * tile_scale)
+                    candidate = image.crop((sx, sy, sx + canvas_w, sy + canvas_h))
 
-                    src_y = random.randint(0, image.height - src_px)
-                    src_x = random.randint(0, image.width - src_px)
-
-                    candidate_crop = image.crop((src_x, src_y, src_x + src_px, src_y + src_px))
-
-                    # Mask score: 1.0 = no masked pixels, <1.0 = some masked pixels
                     mask_score = 1.0
                     if has_mask:
-                        m_region = mask_np_full[src_y:src_y + src_px, src_x:src_x + src_px]
+                        m_region = mask_np_full[sy:sy + canvas_h, sx:sx + canvas_w]
                         mask_score = float(m_region.mean())
 
-                    # Energy: Laplacian variance; mask zeroes out masked contributions
                     energy = 0.0
                     if use_energy:
-                        gray = np.array(candidate_crop.convert("L"), dtype=np.float32) / 255.0
+                        gray = np.array(candidate.convert("L"), dtype=np.float32) / 255.0
                         laplace = (
                             gray[1:-1, 1:-1] * 4 -
                             gray[:-2, 1:-1] - gray[2:, 1:-1] -
                             gray[1:-1, :-2] - gray[1:-1, 2:]
                         )
                         if has_mask:
-                            m_crop = mask.crop((src_x, src_y, src_x + src_px, src_y + src_px))
-                            m_crop = m_crop.convert("L").resize((src_px - 2, src_px - 2), Image.BILINEAR)
-                            laplace = laplace * (np.array(m_crop).astype(np.float32) / 255.0)
+                            m_crop_np = mask_np_full[sy:sy + canvas_h, sx:sx + canvas_w]
+                            import cv2
+                            m_crop_np = cv2.resize(m_crop_np, (canvas_w - 2, canvas_h - 2),
+                                                    interpolation=cv2.INTER_LINEAR)
+                            laplace = laplace * m_crop_np
                         energy = float(np.var(laplace))
 
-                    # Update best: mask coverage PRIMARY, energy secondary tiebreak
-                    if mask_score > best_ms or (mask_score == best_ms and energy > best_energy_val):
-                        best_ms         = mask_score
-                        best_energy_val = energy
-                        best_crop = (candidate_crop, src_x, src_y, src_px, tile_px)
+                    if mask_score > best_ms or (mask_score == best_ms and energy > best_energy):
+                        best_ms     = mask_score
+                        best_energy = energy
+                        best_crop   = (candidate, sx, sy)
 
-                    # Early accept: zero masked pixels AND energy threshold satisfied
                     if mask_score >= 1.0 and (not use_energy or energy >= self.texture_energy_threshold):
                         break
 
-                
-                crop_pil, src_x, src_y, src_px, tile_px = best_crop
-                crop_pil = crop_pil.resize((tile_px, tile_px), Image.LANCZOS)
-                
-                # Encode tile
-                latent = self.t.image2latent(self.t, crop_pil) # [1, C, th, tw]
-                
-                # Handle alpha mask if present
+                crop_pil, sx, sy = best_crop
+                # Encode the full canvas crop directly — no tile scaling needed.
+                latent = self.t.image2latent(self.t, crop_pil)  # [1, C, clat_h, clat_w]
+
+                # Handle alpha mask for the canvas region
                 alpha_crop_mask = None
                 if mask is not None:
-                    mask_crop = mask.crop((src_x, src_y, src_x + src_px, src_y + src_px)).resize((tile_px, tile_px), Image.BILINEAR)
-                    mask_np = np.array(mask_crop).astype(np.float32) / 255.0
-                    alpha_crop_mask = torch.from_numpy(mask_np) # [th, tw]
-                
-                # Place and feather
+                    mask_crop_pil = mask.crop((sx, sy, sx + canvas_w, sy + canvas_h))
+                    mask_crop_pil = mask_crop_pil.resize((canvas_w, canvas_h), Image.BILINEAR)
+                    mask_np = np.array(mask_crop_pil, dtype=np.float32) / 255.0
+                    alpha_crop_mask = torch.from_numpy(mask_np)  # [clat_h, clat_w] (resized to latent dims later)
+
+                # Use the canvas latent directly — no synthetic background, no tile placement.
+                # The mask covers a random sub-region with feathered edges.
                 latent, mask = _place_texture_crop(
-                    latent, canvas_hw, self.texture_feather_latent_px,
+                    latent.squeeze(0),                     # [C, clat_h, clat_w]
+                    self.texture_feather_latent_px,
                     alpha_crop=alpha_crop_mask,
-                    tile_px=tile_px
                 )
                 
                 cond1, cond2 = emb1, emb2
@@ -407,11 +326,21 @@ class LatentsConds(Dataset):
                     tile_res = 0
 
                 if canvas_hw is not None:
-                    # Texture mode (legacy/pre-encoded): sample tile then place
+                    # Texture mode (legacy/pre-encoded): tile the latent to fill canvas
+                    # then create a feathered sub-region mask (no synthetic background).
+                    canvas_h, canvas_w = canvas_hw
+                    clat_h, clat_w = canvas_h // 8, canvas_w // 8
+                    lh, lw = latent.shape[2], latent.shape[3]
+                    if (lh, lw) != (clat_h, clat_w):
+                        # Upsample tile to fill canvas (fallback for pre-encoded data)
+                        latent = F.interpolate(
+                            latent.float(), size=(clat_h, clat_w),
+                            mode='bilinear', align_corners=False,
+                        ).to(latent.dtype)
                     latent, mask = _place_texture_crop(
-                        latent, canvas_hw, self.texture_feather_latent_px,
+                        latent.squeeze(0),
+                        self.texture_feather_latent_px,
                         alpha_crop=alpha_crop_mask,
-                        tile_px=tile_res if tile_res > 0 else None,
                     )
                     batch["batch_type"] = "texture"
                 else:

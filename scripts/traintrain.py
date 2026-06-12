@@ -27,7 +27,7 @@ OPTIMIZERS = ["AdamW", "AdamW8bit", "AdaFactor", "Lion", "Prodigy", SEP,
               "RAdamScheduleFree", "AdamWScheduleFree", "SGDScheduleFree", SEP,
               "CAME", "Tiger", "AdamMini",
               "PagedAdamW", "PagedAdamW32bit", "SGDNesterov", "Adam"]
-LOSS_FUNCTIONS = ["MSE", "L1", "Smooth-L1"]
+LOSS_FUNCTIONS = ["MSE", "L1", "Smooth-L1", "composite"]
 SCHEDULERS = ["linear", "cosine_annealing", "cosine_annealing_with_restarts", "linear", "cosine",
               "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup",
               "piecewise_constant", "exponential", "step", "multi_step",
@@ -67,6 +67,7 @@ t5_tokenizer_path  = ["t5_tokenizer_path",  "TX", None, "", str, ALL]
 
 # Option parameters
 train_loss_function = ["train_loss_function","DD", LOSS_FUNCTIONS, "MSE", str, ALL]
+train_loss_components = ["train_loss_components(e.g. ch_weight(path=./w.pt) + sp_hpf())", "TX", None, "", str, ALL]
 train_seed          = ["train_seed",         "TX", None, -1,    int,   ALL]
 train_model_precision = ["train_model_precision","DD", PRECISION_TYPES[:3], "bf16", str, ALL]
 train_lora_precision  = ["train_lora_precision", "DD", PRECISION_TYPES[:3], "fp32", str, ALL]
@@ -107,7 +108,7 @@ b_column = [image_buckets_step, image_mirroring, image_use_filename_as_tag, imag
             texture_tile_scale, texture_tile_resolution, texture_energy_threshold]
 
 # Other Options (everything else)
-o_column1 = [train_seed, train_loss_function, save_per_steps,
+o_column1 = [train_seed, train_loss_function, train_loss_components, save_per_steps,
              diff_revert_original_target, diff_use_diff_mask]
 o_column2 = [train_model_precision, train_lora_precision, save_precision,
              train_repeat, gradient_accumulation_steps, use_gradient_checkpointing]

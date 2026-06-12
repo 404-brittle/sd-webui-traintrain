@@ -19,7 +19,7 @@ const OPTIMIZERS = [
   "CAME", "Tiger", "AdamMini",
   "PagedAdamW", "PagedAdamW32bit", "SGDNesterov", "Adam"
 ];
-const LOSS_FUNCTIONS = ["MSE", "L1", "Smooth-L1"];
+const LOSS_FUNCTIONS = ["MSE", "L1", "Smooth-L1", "composite"];
 const SCHEDULERS = [
   "linear", "cosine_annealing", "cosine_annealing_with_restarts", "linear", "cosine",
   "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup",
@@ -59,6 +59,7 @@ const ALL_CONFIGS = [
   ["qwen3_path",         "TX", null, "", "str", ALL],
   ["t5_tokenizer_path",  "TX", null, "", "str", ALL],
   ["train_loss_function", "DD", LOSS_FUNCTIONS, "MSE", "str", ALL],
+  ["train_loss_components", "TX", null, "", "str", ALL],
   ["train_seed",          "TX", null, -1,    "int",   ALL],
   ["train_model_precision","DD", PRECISION_TYPES.slice(0,3), "bf16", "str", ALL],
   ["train_lora_precision", "DD", PRECISION_TYPES.slice(0,3), "fp32", "str", ALL],
@@ -100,7 +101,7 @@ const B_COLUMN = ["image_buckets_step", "image_mirroring", "image_use_filename_a
                   "texture_tile_scale", "texture_tile_resolution", "texture_energy_threshold"];
 
 // Other Options (everything else)
-const O_COLUMN1 = ["train_seed", "train_loss_function", "save_per_steps",
+const O_COLUMN1 = ["train_seed", "train_loss_function", "train_loss_components", "save_per_steps",
                    "diff_revert_original_target", "diff_use_diff_mask"];
 const O_COLUMN2 = ["train_model_precision", "train_lora_precision", "save_precision",
                    "train_repeat", "gradient_accumulation_steps", "use_gradient_checkpointing"];
@@ -809,6 +810,22 @@ function init() {
     currentMode = this.value;
     updateModeVisibility();
   });
+
+  // Loss function change → show/hide train_loss_components field
+  const lossFnSelect = document.querySelector('[data-config-name="train_loss_function"] select');
+  if (lossFnSelect) {
+    lossFnSelect.addEventListener('change', function() {
+      const componentsField = document.querySelector('[data-config-name="train_loss_components"]');
+      if (componentsField) {
+        componentsField.style.display = this.value === 'composite' ? '' : 'none';
+      }
+    });
+    // Apply on init
+    const componentsField = document.querySelector('[data-config-name="train_loss_components"]');
+    if (componentsField) {
+      componentsField.style.display = lossFnSelect.value === 'composite' ? '' : 'none';
+    }
+  }
 
   // TS distribution change → update preview + slider visibility
   const distSelect = document.querySelector('[data-config-name="train_timestep_distribution"] select');

@@ -2,6 +2,7 @@ from PIL import Image
 import glob
 import os
 import math
+from math import gcd
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch
@@ -79,142 +80,151 @@ def _squeeze_cond(cond):
     return cond
 
 
-def _freq_matched_background(tile: torch.Tensor, canvas_h: int, canvas_w: int) -> torch.Tensor:
-    """Generate a canvas-sized background whose power spectrum matches `tile` but with
-    completely randomised spatial phase.
+def _current_texture_tile_px(t, epoch: int) -> int:
+    """Return the active tile side in *pixels* for the given epoch.
 
-    The tile has real spatial structure (correlated adjacent latent pixels).  Plain
-    i.i.d. N(μ,σ²) noise has no such correlations.  At intermediate timesteps (~300–700)
-    the model can detect the "correlated region vs. uncorrelated region" boundary in the
-    forward-pass input even though the loss mask zeroes it out, causing boundary/tiling
-    artefacts in the trained LoRA.
-
-    By matching the power spectrum we make the background statistically indistinguishable
-    from texture content: same spatial frequency distribution, different specific content
-    every call.  The model's attention cannot consistently find a boundary.
-
-    Concretely: take the per-channel 2-D FFT of the tile, resample the magnitude spectrum
-    to canvas size, multiply by a fresh unit-complex random phase, then IFFT.
+    Regime: epoch-based, inclusive of max. Every `texture_tile_step_epochs` epochs,
+    the tile size advances by `texture_tile_snap` pixels, clamped to
+    [texture_min_tile, texture_max_tile]. The final N epochs (one full step window)
+    are spent at max_tile so the schedule is inclusive.
     """
-    C = tile.shape[0]
-
-    # Per-channel FFT of the tile (real-to-complex)
-    tile_fft = torch.fft.rfft2(tile.float())           # [C, th, tw//2+1]  complex
-    tile_mag = tile_fft.abs()                          # [C, th, tw//2+1]  real
-
-    # Resample tile magnitude spectrum to canvas FFT dimensions
-    tile_mag_resized = F.interpolate(
-        tile_mag.unsqueeze(0),                         # [1, C, th, tw//2+1]
-        size=(canvas_h, canvas_w // 2 + 1),
-        mode='bilinear', align_corners=False,
-    ).squeeze(0)                                       # [C, canvas_h, canvas_w//2+1]
-
-    # Random unit-complex phase (fresh every call) — on same device as tile
-    rand_angle = torch.rand(C, canvas_h, canvas_w // 2 + 1, device=tile_mag_resized.device) * (2 * math.pi)
-    rand_phase = torch.polar(torch.ones_like(rand_angle), rand_angle)  # unit complex
-
-    # Apply magnitude from tile, random phase
-    result_fft = tile_mag_resized * rand_phase
-    result = torch.fft.irfft2(result_fft, s=(canvas_h, canvas_w))      # [C, H, W]
-
-    return result.to(tile.dtype)
+    min_tile = max(8, int(getattr(t, 'texture_min_tile', 256)))
+    max_tile = max(min_tile, int(getattr(t, 'texture_max_tile', 1024)))
+    snap = max(8, int(getattr(t, 'texture_tile_snap', 128)))
+    step_epochs = max(1, int(getattr(t, 'texture_tile_step_epochs', 5)))
+    stages = (max_tile - min_tile) // snap
+    # stage_index = epoch // step_epochs; clamped so it lands at max for the final stage.
+    stage_index = min(stages, max(0, epoch // step_epochs))
+    tile = min_tile + snap * stage_index
+    return max(min_tile, min(max_tile, tile))
 
 
-def _place_texture_crop(crop_latent: torch.Tensor, canvas_hw: tuple, feather_px: int,
-                        alpha_crop: torch.Tensor | None = None,
-                        tile_px: int | None = None):
-    """Place a square tile from the (pre-scaled) image latent at a random position on a
-    canvas whose background is filled with frequency-matched noise, and return a feathered
-    mask that is non-zero only over the tile region.
+def _current_texture_shift(t, epoch: int) -> float:
+    """Return the active flow-shift value for the given epoch.
 
-    Background fill uses _freq_matched_background: noise with the tile's power spectrum
-    but randomised spatial phase.  This makes the background statistically
-    indistinguishable from real texture content — same spatial correlation structure,
-    different specific values every call.  Plain N(μ,σ²) noise lacks spatial correlations
-    and creates a detectable "correlated vs. uncorrelated" boundary in the forward pass at
-    intermediate timesteps (~300–700), even though the loss mask zeroes it out, leading to
-    boundary/tiling artefacts in the trained LoRA.  Frequency-matched noise eliminates
-    this boundary at all timestep levels, allowing the full 0–1000 range without
-    positional or boundary leakage.
-
-    The mask remains zero outside the tile: the background has no learnable target, so
-    including it in the loss would only add gradient variance.
-
-    Both the source position within the image latent and (when tile_px is None) tile size
-    are re-sampled every call, giving positional/scale variance across DataLoader draws.
-
-    Args:
-        crop_latent: encoded latent of the (already tile-scaled) image, any size.
-        canvas_hw:   (H, W) in pixels of the training canvas.
-        feather_px:  cosine feather width in latent pixels.
-        alpha_crop:  optional [img_lat_h, img_lat_w] float tensor (0-1) aligned with
-                     the full image latent. Multiplied into the feathered patch.
-        tile_px:     if given, the fixed square tile side in *pixels* (divided by 8
-                     for latent space). The tile is clamped to the image latent size
-                     when the image is smaller. When None, tile size is random.
-
-    Returns:
-        canvas  — [1, C, canvas_lat_h, canvas_lat_w]  float tensor
-        mask    — [1, canvas_lat_h, canvas_lat_w]      float tensor in [0, 1]
+    The shift advances by one tile-stage per `texture_shift_step_epochs` epochs,
+    interpolated linearly between texture_min_shift and texture_max_shift.
+    Same inclusivity as the tile schedule.
     """
-    canvas_h, canvas_w = canvas_hw
-    clat_h, clat_w = canvas_h // 8, canvas_w // 8
+    min_shift = float(getattr(t, 'texture_min_shift', 0.5))
+    max_shift = float(getattr(t, 'texture_max_shift', 3.0))
+    if max_shift < min_shift:
+        min_shift, max_shift = max_shift, min_shift
+    snap = max(8, int(getattr(t, 'texture_tile_snap', 128)))
+    min_tile = max(8, int(getattr(t, 'texture_min_tile', 256)))
+    max_tile = max(min_tile, int(getattr(t, 'texture_max_tile', 1024)))
+    stages = max(1, (max_tile - min_tile) // snap)
+    step_epochs = max(1, int(getattr(t, 'texture_shift_step_epochs', 5)))
+    stage_index = min(stages, max(0, epoch // step_epochs))
+    ratio = stage_index / stages
+    return min_shift + (max_shift - min_shift) * ratio
 
-    crop = crop_latent.squeeze(0)          # [C, img_h, img_w]
-    _, ih, iw = crop.shape
 
-    # --- Determine square tile size in latent space ---
-    if tile_px is not None:
-        # Fixed tile: convert pixels → latent units, clamp to what fits in both
-        # the (scaled) image latent and the canvas latent.
-        tile_lat = max(1, tile_px // 8)
-        th = tw = min(tile_lat, ih, iw, clat_h, clat_w)
+def _parse_aspect_ratios(text: str):
+    """Parse ``"2:1,3:1"`` into a list of ``(w_ratio, h_ratio)`` tuples.
+
+    Each entry is ``width:height``.  Both the given ratio and its inverse
+    are added (e.g. ``2:1`` → ``(2,1)`` for horizontal + ``(1,2)`` for vertical).
+    Square ``1:1`` and invalid entries are skipped.
+    Returns an empty list when *text* is empty (backward compatible).
+    """
+    ratios: list = []
+    seen: set = set()
+    if not text:
+        return ratios
+    for part in text.replace(",", " ").split():
+        part = part.strip()
+        if ":" not in part:
+            continue
+        try:
+            w_str, h_str = part.split(":", 1)
+            w, h = int(w_str.strip()), int(h_str.strip())
+            if w <= 0 or h <= 0 or w == h:
+                continue
+            g = gcd(w, h)
+            w //= g
+            h //= g
+            # Add the parsed ratio
+            if (w, h) not in seen:
+                seen.add((w, h))
+                ratios.append((w, h))
+            # Add its inverse (vertical ↔ horizontal)
+            if (h, w) not in seen:
+                seen.add((h, w))
+                ratios.append((h, w))
+        except (ValueError, ZeroDivisionError):
+            continue
+    return ratios
+
+
+def _current_texture_crop_size(t, epoch_now: int, tile_px: int,
+                                img_w: int, img_h: int):
+    """Return ``(crop_w, crop_h)`` for the given epoch under the aspect-ratio schedule.
+
+    Early epochs always use square crops (``tile_px × tile_px``).  As training
+    progresses, non-square aspect ratios from ``t.crop_aspect`` are mixed in with
+    linearly increasing probability, reaching 0.5 at the final tile-size stage.
+
+    The crop is computed as the **largest rectangle** at the chosen aspect ratio
+    that fits entirely within the image bounds (``scale = min(img_w / w_ratio,
+    img_h / h_ratio)``), so it never exceeds the canvas.  Wide images prioritise
+    horizontal ratios; tall images prioritise vertical ratios.
+
+    Both dimensions are aligned to 16 px for VAE × DiT patch compatibility.
+    When no aspect ratios are configured, always returns the square size
+    (backward compatible).
+    """
+    aspect_text = getattr(t, 'texture_crop_aspect', '') or ''
+    all_ratios = _parse_aspect_ratios(aspect_text)
+    if not all_ratios:
+        return tile_px, tile_px
+
+    # Determine training progress as a fraction 0..1 based on the tile schedule.
+    min_tile = max(8, int(getattr(t, 'texture_min_tile', 256)))
+    max_tile = max(min_tile, int(getattr(t, 'texture_max_tile', 1024)))
+    snap = max(8, int(getattr(t, 'texture_tile_snap', 128)))
+    step_epochs = max(1, int(getattr(t, 'texture_tile_step_epochs', 5)))
+    stages = (max_tile - min_tile) // snap
+    if stages > 0:
+        stage_index = min(stages, max(0, epoch_now // step_epochs))
+        progress = stage_index / stages
     else:
-        # Random tile: uniform in [max/4, max] where max fits both image and canvas.
-        max_tile = min(ih, iw, clat_h, clat_w)
-        min_tile = max(1, max_tile // 4)
-        th = tw = random.randint(min_tile, max_tile)
+        progress = 1.0
 
-    # Random source position within the image latent
-    src_y = random.randint(0, ih - th)
-    src_x = random.randint(0, iw - tw)
-    tile = crop[:, src_y:src_y + th, src_x:src_x + tw]   # [C, th, tw]
+    # Probability of picking a non-square crop: ramps from 0 → 0.5.
+    mix_p = 0.5 * progress
 
-    # --- Random destination position within the canvas ---
-    max_oy = clat_h - th
-    max_ox = clat_w - tw
-    oy = random.randint(0, max_oy)
-    ox = random.randint(0, max_ox)
+    if random.random() >= mix_p:
+        return tile_px, tile_px  # square
 
-    # Fill background with frequency-matched noise: same power spectrum as the tile
-    # but randomised spatial phase, so the background looks like texture-like content
-    # with no consistent boundary the model can detect or memorise.
-    canvas = _freq_matched_background(tile, clat_h, clat_w)
-    canvas[:, oy:oy + th, ox:ox + tw] = tile
+    # Prioritise aspect ratios that match the image orientation:
+    #   wide image → horizontal ratios (w > h)
+    #   tall image → vertical ratios   (h > w)
+    is_wide = img_w >= img_h
+    candidates = [(w, h) for w, h in all_ratios if (w > h) == is_wide]
+    if not candidates:
+        candidates = all_ratios
 
-    # Feathered mask: cosine taper over `feather` latent pixels from every edge
-    feather = min(feather_px, th // 2, tw // 2)
-    patch = torch.ones(th, tw)
-    for d in range(feather):
-        v = 0.5 * (1.0 - math.cos(math.pi * d / feather))
-        patch[d, :]      *= v   # top edge
-        patch[th-1-d, :] *= v   # bottom edge
-        patch[:, d]      *= v   # left edge
-        patch[:, tw-1-d] *= v   # right edge
+    w_ratio, h_ratio = random.choice(candidates)
 
-    # Blend in alpha mask (from image alpha channel or external mask file).
-    # alpha_crop is aligned with the full image latent, so crop the same region.
-    if alpha_crop is not None:
-        ac = alpha_crop
-        if ac.shape != (ih, iw):
-            ac = F.interpolate(ac.unsqueeze(0).unsqueeze(0).float(),
-                               size=(ih, iw), mode='bilinear', align_corners=False)[0, 0]
-        patch = patch * ac[src_y:src_y + th, src_x:src_x + tw]
+    # Largest rectangle at (w_ratio : h_ratio) that fits inside (img_w, img_h).
+    scale = min(img_w / w_ratio, img_h / h_ratio)
+    crop_w = int(w_ratio * scale)
+    crop_h = int(h_ratio * scale)
 
-    mask = torch.zeros(1, clat_h, clat_w)
-    mask[0, oy:oy + th, ox:ox + tw] = patch
+    # Align to 16px (VAE downsample 8× × DiT spatial_patch_size 2).
+    crop_w = max(16, (crop_w // 16) * 16)
+    crop_h = max(16, (crop_h // 16) * 16)
 
-    return canvas.unsqueeze(0), mask   # [1,C,H,W], [1,H,W]
+    # Re-check fit after alignment (rounding may push us 1 px over).
+    crop_w = min(crop_w, img_w)
+    crop_h = min(crop_h, img_h)
+
+    # If the result is effectively square, fall back to square.
+    if abs(crop_w - crop_h) < 16:
+        return tile_px, tile_px
+
+    return crop_w, crop_h
 
 
 class LatentsConds(Dataset):
@@ -229,9 +239,6 @@ class LatentsConds(Dataset):
         # image_num_multiply hardcoded to 1
         if t.train_batch_size > len(self.latents_conds):
             self.latents_conds = self.latents_conds * t.train_batch_size
-        # Fixed canvas size for the entire epoch so all items in a batch share the
-        # same spatial dimensions (avoids DataLoader collation errors in texture mode).
-        self._current_canvas_hw = None
 
     def __len__(self):
         return len(self.latents_conds)
@@ -242,7 +249,7 @@ class LatentsConds(Dataset):
             origs, targs = self.latents_conds[i]
             if self.revert:
                 targs, origs = origs, targs
-            orig_latent, orig_mask, orig_cond1, orig_cond2 = origs  
+            orig_latent, orig_mask, orig_cond1, orig_cond2 = origs
             targ_latent, targ_mask, targ_cond1, targ_cond2 = targs
 
             batch["orig_latent"] = orig_latent.squeeze()
@@ -255,59 +262,41 @@ class LatentsConds(Dataset):
 
         else:
             item = self.latents_conds[i]
-            
-            # Detect JIT texture source
+
+            # Texture-mode JIT source: pull a square tile from the source image
+            # at the schedule-driven pixel size, encode it, and use it directly
+            # as the full latent (no canvas, no background noise, no feather).
             if isinstance(item, list) and item[0] == "texture_source":
-                _, image, mask, emb1, emb2, canvas_hw, tile_res, tile_scale = item
+                _, image, mask, emb1, emb2 = item
 
-                _TEXTURE_CANVAS_PRESETS = [
-                    (640, 1536), (1536, 640),
-                    (832, 1216), (1216, 832),
-                    (1024, 1024), (1024, 1024), #twice, for 1/3 chance.
-                ]
+                # Determine the active tile size in pixels for this epoch.
+                # `t.dataloader.epoch` is set by ContinualRandomDataLoader and is
+                # incremented every full pass through the dataset.
+                epoch_now = getattr(getattr(self.t, 'dataloader', None), 'epoch', 0)
+                tile_px_target = _current_texture_tile_px(self.t, epoch_now)
+                # Image can be smaller than the target; clamp to image side.
+                tile_px_target = min(tile_px_target, image.width, image.height)
+                # Align tile size to VAE × DiT patch alignment (16px).
+                # The VAE downsamples by 8× (3 stride-2 convs with padding)
+                # and the DiT uses spatial_patch_size=2.  If the crop
+                # dimension is not a multiple of 16 the resulting latent H/W
+                # may be odd, which triggers a PatchEmbed assertion failure
+                # (e.g. H,W (87, 87) should be divisible by patch_size 2).
+                tile_px_target = (tile_px_target // 16) * 16
+                if tile_px_target < 16:
+                    tile_px_target = 16
 
-                # Hybrid fullres mode: resize entire image to a canvas matching its
-                # aspect ratio and encode — no crop, no mask, no canvas noise.
-                if getattr(self.t, 'hybrid_processing_mode', None) == "fullres":
-                    img_ar = image.width / image.height
-                    canvas_hw = min(_TEXTURE_CANVAS_PRESETS,
-                                    key=lambda hw: abs(hw[1] / hw[0] - img_ar))
-                    canvas_h, canvas_w = canvas_hw
-                    # Scale to cover the canvas (preserve AR), then center-crop the
-                    # overhang.  This cuts a tiny sliver of data rather than squashing.
-                    scale = max(canvas_w / image.width, canvas_h / image.height)
-                    scaled_w = round(image.width * scale)
-                    scaled_h = round(image.height * scale)
-                    img_resized = image.resize((scaled_w, scaled_h), Image.LANCZOS)
-                    left = (scaled_w - canvas_w) // 2
-                    top  = (scaled_h - canvas_h) // 2
-                    img_resized = img_resized.crop((left, top, left + canvas_w, top + canvas_h))
-                    latent = self.t.image2latent(self.t, img_resized)
-                    mask = None
-                    cond1, cond2 = emb1, emb2
-                    batch["batch_type"] = "fullres"
-                    batch["latent"] = latent.squeeze().cpu()
-                    if cond1 is not None: batch["cond1"] = cond1 if isinstance(cond1, (str, tuple, list)) else cond1.squeeze().cpu()
-                    if cond2 is not None: batch["cond2"] = cond2 if isinstance(cond2, (str, tuple, list)) else cond2.squeeze().cpu()
-                    return batch
+                # Determine aspect-ratio-adjusted crop size for this epoch.
+                # Non-square ratios (e.g. 2:1, 3:1) are mixed in with increasing
+                # probability as training progresses to reduce square-crop bias.
+                crop_w, crop_h = _current_texture_crop_size(
+                    self.t, epoch_now, tile_px_target, image.width, image.height,
+                )
 
-                # Fixed canvas size for the entire epoch so all items in a batch
-                # share the same spatial dimensions (avoids collation errors).
-                if self._current_canvas_hw is None:
-                    self._current_canvas_hw = random.choice(_TEXTURE_CANVAS_PRESETS)
-                canvas_hw = self._current_canvas_hw
-
-                # JIT: Randomly crop, scale, and encode
-                canvas_h, canvas_w = canvas_hw
-                clat_h, clat_w = canvas_h // 8, canvas_w // 8
-                
                 best_crop = None
                 best_energy = -1
                 best_mask_score = -1.0
 
-                # Pre-compute full-resolution mask as numpy for fast per-crop mean.
-                # Only built when texture_avoid_masked is set; None disables all
-                # mask scoring so the loop runs just once and takes the first crop.
                 mask_np_full = None
                 if mask is not None and self.texture_avoid_masked:
                     mask_np_full = np.array(mask.convert("L"), dtype=np.float32) / 255.0
@@ -318,37 +307,21 @@ class LatentsConds(Dataset):
 
                 best_ms         = -1.0
                 best_energy_val = -1.0
+                best_region     = (0, 0)
 
                 for attempt in range(max_attempts):
-                    # Resolve tile size in pixels
-                    if tile_res > 0:
-                        tile_px = tile_res
-                    else:
-                        max_tile_lat = min(image.width // 8, image.height // 8, clat_h, clat_w)
-                        if tile_scale > 1.0:
-                            max_tile_lat = min(max_tile_lat, round(image.width * tile_scale) // 8, round(image.height * tile_scale) // 8)
-                        min_tile_lat = max(1, max_tile_lat // 4)
-                        tile_lat = random.randint(min_tile_lat, max_tile_lat)
-                        tile_px = tile_lat * 8
+                    src_y = random.randint(0, image.height - crop_h)
+                    src_x = random.randint(0, image.width - crop_w)
 
-                    src_px = max(8, round(tile_px / tile_scale))
-                    src_px = min(src_px, image.width, image.height)
-                    tile_px = round(src_px * tile_scale)
+                    candidate_crop = image.crop((src_x, src_y, src_x + crop_w, src_y + crop_h))
 
-                    src_y = random.randint(0, image.height - src_px)
-                    src_x = random.randint(0, image.width - src_px)
-
-                    candidate_crop = image.crop((src_x, src_y, src_x + src_px, src_y + src_px))
-
-                    # Mask score: 1.0 = no masked pixels, <1.0 = some masked pixels
                     mask_score = 1.0
                     if has_mask:
-                        m_region = mask_np_full[src_y:src_y + src_px, src_x:src_x + src_px]
+                        m_region = mask_np_full[src_y:src_y + crop_h, src_x:src_x + crop_w]
                         mask_score = float(m_region.mean())
 
-                    # Energy: Laplacian variance; mask zeroes out masked contributions
                     energy = 0.0
-                    if use_energy:
+                    if use_energy and min(crop_w, crop_h) >= 3:
                         gray = np.array(candidate_crop.convert("L"), dtype=np.float32) / 255.0
                         laplace = (
                             gray[1:-1, 1:-1] * 4 -
@@ -356,71 +329,70 @@ class LatentsConds(Dataset):
                             gray[1:-1, :-2] - gray[1:-1, 2:]
                         )
                         if has_mask:
-                            m_crop = mask.crop((src_x, src_y, src_x + src_px, src_y + src_px))
-                            m_crop = m_crop.convert("L").resize((src_px - 2, src_px - 2), Image.BILINEAR)
+                            m_crop = mask.crop((src_x, src_y, src_x + crop_w, src_y + crop_h))
+                            m_crop = m_crop.convert("L").resize(
+                                (gray.shape[1] - 2, gray.shape[0] - 2), Image.BILINEAR)
                             laplace = laplace * (np.array(m_crop).astype(np.float32) / 255.0)
                         energy = float(np.var(laplace))
 
-                    # Update best: mask coverage PRIMARY, energy secondary tiebreak
                     if mask_score > best_ms or (mask_score == best_ms and energy > best_energy_val):
                         best_ms         = mask_score
                         best_energy_val = energy
-                        best_crop = (candidate_crop, src_x, src_y, src_px, tile_px)
+                        best_crop = candidate_crop
+                        best_region = (src_x, src_y)
 
-                    # Early accept: zero masked pixels AND energy threshold satisfied
                     if mask_score >= 1.0 and (not use_energy or energy >= self.texture_energy_threshold):
                         break
 
-                
-                crop_pil, src_x, src_y, src_px, tile_px = best_crop
-                crop_pil = crop_pil.resize((tile_px, tile_px), Image.LANCZOS)
-                
-                # Encode tile
-                latent = self.t.image2latent(self.t, crop_pil) # [1, C, th, tw]
-                
-                # Handle alpha mask if present
-                alpha_crop_mask = None
-                if mask is not None:
-                    mask_crop = mask.crop((src_x, src_y, src_x + src_px, src_y + src_px)).resize((tile_px, tile_px), Image.BILINEAR)
+                # Resize the (possibly non-square) crop to the square tile size for
+                # consistent latent dimensions across the batch.  Squashing/stretching
+                # is acceptable because the model learns invariance to crop framing,
+                # which is the goal of mixing aspect ratios.
+                crop_pil = best_crop.resize((tile_px_target, tile_px_target), Image.LANCZOS)
+
+                # Encode tile directly. No canvas, no background fill, no feather.
+                latent = self.t.image2latent(self.t, crop_pil)  # [1, C, th, tw]
+
+                # Loss mask: cosine-feathered edge taper across `feather_px` latent
+                # pixels. Interior is 1.0; loss is computed over the full tile but
+                # the edges are slightly downweighted to keep the train target
+                # consistent with the padded "all-ones" boundary of the latent.
+                th_lat = tile_px_target // 8
+                feather = max(0, min(self.texture_feather_latent_px, th_lat // 2))
+                loss_mask = torch.ones(th_lat, th_lat)
+                if feather > 0:
+                    for d in range(feather):
+                        v = 0.5 * (1.0 - math.cos(math.pi * d / feather))
+                        loss_mask[d, :]      *= v
+                        loss_mask[th_lat - 1 - d, :] *= v
+                        loss_mask[:, d]      *= v
+                        loss_mask[:, th_lat - 1 - d] *= v
+
+                # Blend in alpha mask if available, aligned with the actual region.
+                if mask is not None and has_mask:
+                    sx, sy = best_region
+                    mask_crop = mask.crop((sx, sy, sx + crop_w, sy + crop_h))
+                    mask_crop = mask_crop.convert("L").resize((tile_px_target, tile_px_target), Image.BILINEAR)
                     mask_np = np.array(mask_crop).astype(np.float32) / 255.0
-                    alpha_crop_mask = torch.from_numpy(mask_np) # [th, tw]
-                
-                # Place and feather
-                latent, mask = _place_texture_crop(
-                    latent, canvas_hw, self.texture_feather_latent_px,
-                    alpha_crop=alpha_crop_mask,
-                    tile_px=tile_px
-                )
-                
+                    alpha_lat = torch.from_numpy(
+                        F.interpolate(
+                            torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0),
+                            size=(th_lat, th_lat), mode='bilinear', align_corners=False
+                        )[0, 0].numpy()
+                    )
+                    loss_mask = loss_mask * alpha_lat
+
                 cond1, cond2 = emb1, emb2
                 batch["batch_type"] = "texture"
+                batch["mask"] = loss_mask.cpu()
             else:
-                if len(item) == 6:
-                    latent, alpha_crop_mask, cond1, cond2, canvas_hw, tile_res = item
-                elif len(item) == 5:
-                    latent, alpha_crop_mask, cond1, cond2, canvas_hw = item
-                    tile_res = 0
-                else:
-                    latent, mask, cond1, cond2 = item
-                    canvas_hw = None
-                    alpha_crop_mask = None
-                    tile_res = 0
-
-                if canvas_hw is not None:
-                    # Texture mode (legacy/pre-encoded): sample tile then place
-                    latent, mask = _place_texture_crop(
-                        latent, canvas_hw, self.texture_feather_latent_px,
-                        alpha_crop=alpha_crop_mask,
-                        tile_px=tile_res if tile_res > 0 else None,
-                    )
-                    batch["batch_type"] = "texture"
-                else:
-                    batch["batch_type"] = "fullres"
+                # Pre-encoded latent path (non-texture): straight forward.
+                latent, mask, cond1, cond2 = item
+                batch["batch_type"] = "fullres"
 
             batch["latent"] = latent.squeeze().cpu()
             if cond1 is not None: batch["cond1"] = cond1 if isinstance(cond1, (str, tuple, list)) else cond1.squeeze().cpu()
             if cond2 is not None: batch["cond2"] = cond2 if isinstance(cond2, (str, tuple, list)) else cond2.squeeze().cpu()
-            if isinstance(mask, torch.Tensor): batch["mask"] = mask.squeeze().cpu()
         return batch
 
 TARGET_IMAGEFILES = ["jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp", "webp", "pcx", "ico"]
@@ -554,11 +526,10 @@ def load_resize_image_and_text(t):
         if pair_size is not None and image.size != pair_size:
             image = image.resize(pair_size, Image.LANCZOS)
 
-        # --- Texture mode OR hybrid mode (all images stored as JIT PIL sources) ---
-        if getattr(t, 'texture_mode', False) or getattr(t, 'train_hybrid_mode', False):
-            canvas_key = (t.image_size[0], t.image_size[0])
+        # --- Texture mode: store raw PIL sources for JIT tile extraction. ---
+        if getattr(t, 'texture_mode', False):
+            bucket_key = (t.image_size[0], t.image_size[0])
 
-            # JIT UPDATE: Store raw PIL objects
             mask_img = None
             if image.mode == "RGBA":
                 mask_img = image.split()[3]
@@ -572,9 +543,9 @@ def load_resize_image_and_text(t):
                             mask_img = Image.open(_mp).convert("L").resize(
                                 (image.width, image.height), Image.LANCZOS)
                             break
-            
+
             image = image.convert("RGB")
-            t.image_buckets_raw[canvas_key].append([
+            t.image_buckets_raw[bucket_key].append([
                 image, mask_img,
                 load_text_files(txt_path), load_text_files(cap_path),
                 filename, img_path, targ_path, True,
@@ -689,12 +660,9 @@ def encode_image_text(t):
                     emb1 = emb2 = prompt
 
                 if is_texture:
-                    canvas_hw = (key[1], key[0])
-                    tile_res = getattr(t, 'texture_tile_resolution', 0)
-                    tile_scale = getattr(t, 'texture_tile_scale', 1.0)
                     t.image_buckets[key].append([
                         "texture_source", image, mask,
-                        emb1, emb2, canvas_hw, tile_res, tile_scale
+                        emb1, emb2
                     ])
                 else:
                     t.image_buckets[key].append([latent, mask, emb1, emb2])

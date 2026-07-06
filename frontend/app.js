@@ -66,12 +66,19 @@ const ALL_CONFIGS = [
   ["image_mirroring",     "CH", null, false, "bool", LORA_MDIFF],
   ["image_use_filename_as_tag","CH", null, false, "bool", LORA_MDIFF],
   ["image_disable_upscale","CH", null, false, "bool", LORA_MDIFF],
-  ["texture_mode",        "CH", null, false, "bool", LORA_MDIFF],
+  ["texture_mode",        "CH", null, true, "bool", LORA_MDIFF],
+  ["texture_min_tile(px)", "TX", null, 256, "int", LORA_MDIFF],
+  ["texture_max_tile(px)", "TX", null, 1024, "int", LORA_MDIFF],
+  ["texture_tile_snap(px)", "TX", null, 128, "int", LORA_MDIFF],
+  ["texture_min_shift",    "TX", null, 0.5, "float", LORA_MDIFF],
+  ["texture_max_shift",    "TX", null, 3.0, "float", LORA_MDIFF],
+  ["texture_tile_step_epochs",  "TX", null, 5, "int", LORA_MDIFF],
+  ["texture_shift_step_epochs", "TX", null, 5, "int", LORA_MDIFF],
   ["texture_feather_latent_px", "TX", null, 2, "int", LORA_MDIFF],
   ["texture_mask_directory", "TX", null, "", "str", LORA_MDIFF],
-  ["texture_tile_scale",  "TX", null, 1.0, "float", LORA_MDIFF],
-  ["texture_tile_resolution", "TX", null, 0, "int", LORA_MDIFF],
   ["texture_energy_threshold", "TX", null, 0, "float", LORA_MDIFF],
+  ["texture_avoid_masked", "CH", null, true, "bool", LORA_MDIFF],
+  ["texture_crop_aspect(e.g. 2:1,3:1)", "TX", null, "", "str", LORA_MDIFF],
   ["save_per_steps",      "TX", null, 0,    "int",   ALL],
   ["save_precision",      "DD", PRECISION_TYPES.slice(0,3), "fp16", "str", ALL],
   ["diff_revert_original_target","CH", null, false, "bool", DIFF],
@@ -84,7 +91,7 @@ const ALL_CONFIGS = [
   ["train_timestep_distribution", "DD", TIMESTEP_DISTRIBUTIONS, "flow_shift", "str", ALL],
   ["train_ts_dist_params(e.g. mean=0.0 std=1.0)", "TX", null, "", "str", ALL],
   ["train_ts_schedule",   "ML", null, "",   "str",   ALL],
-  ["train_hybrid_mode",   "CH", null, false, "bool", ALL],
+  ["train_hybrid_mode(legacy, unused)",   "CH", null, false, "bool", ALLN],
   ["network_module_filter(regex, !prefix=exclude)", "TX", null, "", "str", ALL],
 ];
 
@@ -96,8 +103,10 @@ const R_COLUMN3 = ["train_optimizer", "train_optimizer_settings", "train_lr_sche
 
 // Bucket / Texture parameters
 const B_COLUMN = ["image_buckets_step", "image_mirroring", "image_use_filename_as_tag", "image_disable_upscale",
-                  "train_fixed_timsteps_in_batch", "texture_mode", "texture_feather_latent_px", "texture_mask_directory",
-                  "texture_tile_scale", "texture_tile_resolution", "texture_energy_threshold"];
+                  "train_fixed_timsteps_in_batch", "texture_mode", "texture_min_tile(px)", "texture_max_tile(px)", "texture_tile_snap(px)",
+                  "texture_min_shift", "texture_max_shift", "texture_tile_step_epochs", "texture_shift_step_epochs",
+                  "texture_feather_latent_px", "texture_mask_directory", "texture_energy_threshold",
+                  "texture_avoid_masked", "texture_crop_aspect(e.g. 2:1,3:1)"];
 
 // Other Options (everything else)
 const O_COLUMN1 = ["train_seed", "train_loss_function", "save_per_steps",

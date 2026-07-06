@@ -293,10 +293,10 @@ def train_lora(t):
     loss_ema = None
     loss_velocity = None
 
-    _train_hybrid = getattr(t, 'train_hybrid_mode', False)
+    _train_hybrid = getattr(t, 'train_hybrid_mode', False)  # legacy, kept for back-compat
 
-    # VAE must stay alive for JIT encoding: texture_mode OR hybrid mode
-    if not getattr(t, 'texture_mode', False) and not _train_hybrid:
+    # VAE must stay alive for JIT encoding in texture mode.
+    if not getattr(t, 'texture_mode', False):
         del t.vae
         if "BASE" not in t.network_blocks:
             del t.text_model
@@ -306,19 +306,7 @@ def train_lora(t):
     # Parse timestep curriculum schedule from inline config text (optional)
     _ts_schedule = _parse_ts_schedule_text(getattr(t, 'train_ts_schedule', '') or '')
     if _ts_schedule:
-        print(f"Timestep schedule loaded: {len(_ts_schedule)} entries"
-              + (", hybrid mode active" if _train_hybrid else ""))
-
-    # Prime hybrid processing mode before the first batch is fetched
-    def _set_hybrid_mode(step_pct):
-        if not _train_hybrid:
-            return
-        mode = ""
-        if _ts_schedule:
-            mode = _resolve_ts_entry(_ts_schedule, step_pct)[3]
-        t.hybrid_processing_mode = mode or "texture"
-
-    _set_hybrid_mode(0.0)
+        print(f"Timestep schedule loaded: {len(_ts_schedule)} entries")
 
     pbar = tqdm(range(t.train_iterations))
     while t.train_iterations >= pbar.n:
@@ -348,10 +336,19 @@ def train_lora(t):
                 ts_lo = max(0, ts_lo)
                 ts_hi = max(ts_lo + 1, min(1000, ts_hi))
 
+                # Texture mode drives the active flow-shift value from the
+                # epoch-based min/max schedule. Outside texture mode, the shift is
+                # the static value parsed from `train_ts_dist_params`.
+                if getattr(t, 'texture_mode', False):
+                    epoch_now = getattr(getattr(t, 'dataloader', None), 'epoch', 0)
+                    active_shift = _current_texture_shift(t, epoch_now)
+                else:
+                    active_shift = _parse_flow_shift(getattr(t, 'train_ts_dist_params', '') or '')
+
                 dist_type  = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
                 dist_params = getattr(t, 'train_ts_dist_params', '') or ''
                 n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
-                timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, CUDA, dist_type, dist_params)
+                timesteps = _sample_timesteps(ts_lo, ts_hi, n_ts, CUDA, dist_type, active_shift, dist_params)
                 timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
 
                 noisy_latents = t.noise_scheduler.add_noise(latents, noise, timesteps)
@@ -379,10 +376,28 @@ def train_lora(t):
                 )
 
                 c_lrs = [f"{x:.2e}" for x in lr_scheduler.get_last_lr()]
-                _mode_tag = f"/{t.hybrid_processing_mode}" if _train_hybrid and hasattr(t, 'hybrid_processing_mode') else ""
+                _tile_now = _current_texture_tile_px(t, t.dataloader.epoch) if getattr(t, 'texture_mode', False) else None
+                _shift_now = active_shift if getattr(t, 'texture_mode', False) else None
+                _tex_tag = ""
+                if _tile_now is not None:
+                    _crop_aspect_str = ""
+                    _aspect_text = getattr(t, 'texture_crop_aspect', '') or ''
+                    if _aspect_text:
+                        from trainer.dataset import _parse_aspect_ratios
+                        _ar = _parse_aspect_ratios(_aspect_text)
+                        if _ar:
+                            # Pick the first matching-orientation ratio for display.
+                            _is_wide = _tile_now >= _tile_now  # always True (square ref), so pick horizontal
+                            _disp = [(w, h) for w, h in _ar if (w > h)]
+                            if not _disp:
+                                _disp = _ar
+                            _w, _h = _disp[0]
+                            _dir = "H" if _w > _h else "V"
+                            _crop_aspect_str = f" Crop:{_w}:{_h}{_dir}"
+                    _tex_tag = f" Tile: {_tile_now}px Shift: {_shift_now:.2f}{_crop_aspect_str}"
                 pbar.set_description(
                     f"Loss EMA * 1000: {loss_ema * 1000:.4f}, LR: " + ", ".join(c_lrs) +
-                    f", TS: {ts_lo}-{ts_hi}{_mode_tag}, Epoch: {t.dataloader.epoch}"
+                    f", TS: {ts_lo}-{ts_hi}{_tex_tag}, Epoch: {t.dataloader.epoch}"
                 )
                 pbar.update(1)
 
@@ -398,9 +413,6 @@ def train_lora(t):
 
                 del model_pred
                 flush()
-
-                # Update hybrid mode for the NEXT batch fetch (1-step ahead)
-                _set_hybrid_mode(pbar.n / max(1, t.train_iterations - 1))
 
                 result = finisher(network, t, pbar.n)
                 if result is not None:
@@ -438,8 +450,6 @@ def train_diff2(t):
         del t.vae
         if "BASE" not in t.network_blocks:
             del t.text_model
-
-    flush()
 
     network, optimizer, lr_scheduler = create_network(t)
 
@@ -491,10 +501,13 @@ def train_diff2(t):
 
             dist_type   = getattr(t, 'train_timestep_distribution', 'flow_shift') or 'flow_shift'
             dist_params = getattr(t, 'train_ts_dist_params', '') or ''
+            active_shift = (_current_texture_shift(t, epoch)
+                            if getattr(t, 'texture_mode', False)
+                            else _parse_flow_shift(dist_params))
             n_ts = 1 if t.train_fixed_timsteps_in_batch else batch_size
             band_lo = int(min(time_min, ts_range_hi - 1))
             band_hi = int(max(time_max, ts_range_lo + 1))
-            timesteps = _sample_timesteps(band_lo, band_hi, n_ts, CUDA, dist_type, dist_params)
+            timesteps = _sample_timesteps(band_lo, band_hi, n_ts, CUDA, dist_type, active_shift, dist_params)
             timesteps = torch.cat([timesteps.long()] * (batch_size if t.train_fixed_timsteps_in_batch else 1))
 
             orig_noisy_latents = t.noise_scheduler.add_noise(
@@ -567,24 +580,20 @@ def flush():
     gc.collect()
 
 
-def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, device,
-                       dist_type: str = "flow_shift", dist_params: str = "") -> torch.Tensor:
-    """Sample n integer timesteps in [ts_lo, ts_hi) using the specified distribution.
+def _parse_flow_shift(dist_params: str) -> float:
+    """Extract `shift=...` from the dist_params text; default 3.0."""
+    for item in (dist_params or "").replace(",", " ").split():
+        if "=" in item:
+            k, v = item.split("=", 1)
+            if k.strip() == "shift":
+                try:
+                    return float(v.strip())
+                except ValueError:
+                    pass
+    return 3.0
 
-    dist_type:
-      "uniform"      — flat torch.randint
-      "flow_shift"   — bias toward high-noise via shift factor (sd-scripts convention)
-      "logit_normal" — sigmoid of Normal(mean, std); params: mean=0.0 std=1.0
-      "cosmap"       — cosine bijection; bias toward mid-noise
-      "beta"         — Beta(alpha, beta); params: alpha=0.5 beta=0.5
-                       alpha=beta=0.5 → inverse bell (U-shape), alpha=beta>1 → bell,
-                       alpha=beta=1 → uniform, alpha≠beta → skewed
-    """
-    import math as _math
 
-    span = ts_hi - ts_lo
-
-    # Parse "key=value ..." pairs shared by logit_normal and beta
+def _parse_dist_params(dist_params: str) -> dict:
     params: dict = {}
     for item in (dist_params or "").replace(",", " ").split():
         if "=" in item:
@@ -593,6 +602,60 @@ def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, device,
                 params[k.strip()] = float(v.strip())
             except ValueError:
                 pass
+    return params
+
+
+def _current_texture_tile_px(t, epoch: int) -> int:
+    """Mirror of dataset._current_texture_tile_px — used by the progress bar."""
+    min_tile = max(8, int(getattr(t, 'texture_min_tile', 256)))
+    max_tile = max(min_tile, int(getattr(t, 'texture_max_tile', 1024)))
+    snap = max(8, int(getattr(t, 'texture_tile_snap', 128)))
+    step_epochs = max(1, int(getattr(t, 'texture_tile_step_epochs', 5)))
+    stages = (max_tile - min_tile) // snap
+    stage_index = min(stages, max(0, epoch // step_epochs))
+    return max(min_tile, min(max_tile, min_tile + snap * stage_index))
+
+
+def _current_texture_shift(t, epoch: int) -> float:
+    """Active flow-shift for this epoch under the texture min/max schedule."""
+    min_shift = float(getattr(t, 'texture_min_shift', 0.5))
+    max_shift = float(getattr(t, 'texture_max_shift', 3.0))
+    if max_shift < min_shift:
+        min_shift, max_shift = max_shift, min_shift
+    snap = max(8, int(getattr(t, 'texture_tile_snap', 128)))
+    min_tile = max(8, int(getattr(t, 'texture_min_tile', 256)))
+    max_tile = max(min_tile, int(getattr(t, 'texture_max_tile', 1024)))
+    stages = max(1, (max_tile - min_tile) // snap)
+    step_epochs = max(1, int(getattr(t, 'texture_shift_step_epochs', 5)))
+    stage_index = min(stages, max(0, epoch // step_epochs))
+    return min_shift + (max_shift - min_shift) * (stage_index / stages)
+
+
+def _current_texture_crop_size(t, epoch: int, tile_px: int,
+                                img_w: int, img_h: int):
+    """Mirror of dataset._current_texture_crop_size — used by the progress bar."""
+    # Import and delegate to the canonical implementation.
+    from trainer.dataset import _current_texture_crop_size as _impl
+    return _impl(t, epoch, tile_px, img_w, img_h)
+
+
+def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, device,
+                       dist_type: str = "flow_shift", shift: float = 3.0,
+                       dist_params: str = "") -> torch.Tensor:
+    """Sample n integer timesteps in [ts_lo, ts_hi) using the specified distribution.
+
+    dist_type:
+      "uniform"      — flat torch.randint
+      "flow_shift"   — bias toward high-noise via shift factor (sd-scripts convention).
+                       The `shift` argument is used directly when > 1.0.
+      "logit_normal" — sigmoid of Normal(mean, std); parameters read from dist_params
+      "cosmap"       — cosine bijection; bias toward mid-noise
+      "beta"         — Beta(alpha, beta); parameters read from dist_params
+    """
+    import math as _math
+
+    span = ts_hi - ts_lo
+    params = _parse_dist_params(dist_params)
 
     if dist_type == "uniform":
         return torch.randint(ts_lo, ts_hi, (n,), device=device)
@@ -605,23 +668,21 @@ def _sample_timesteps(ts_lo: int, ts_hi: int, n: int, device,
         return (sigma * span + ts_lo).long().clamp(ts_lo, ts_hi - 1)
 
     if dist_type == "cosmap":
-        # sigma = 1 - 1 / (tan(pi/2 * u) + 1)  for u ~ Uniform(0, 1)
         u = torch.rand(n, device=device).clamp(1e-6, 1.0 - 1e-6)
         sigma = 1.0 - 1.0 / (torch.tan(u * (_math.pi / 2.0)) + 1.0)
         return (sigma * span + ts_lo).long().clamp(ts_lo, ts_hi - 1)
 
     if dist_type == "beta":
-        # Beta(alpha, beta): alpha=beta=0.5 → inverse bell, alpha=beta>1 → bell
         alpha = max(0.01, params.get("alpha", 0.5))
-        beta  = max(0.01, params.get("beta",  0.5))
+        beta_p = max(0.01, params.get("beta", 0.5))
         sigma = torch.distributions.Beta(
             torch.tensor(alpha, dtype=torch.float32, device=device),
-            torch.tensor(beta,  dtype=torch.float32, device=device),
+            torch.tensor(beta_p, dtype=torch.float32, device=device),
         ).sample((n,))
         return (sigma * span + ts_lo).long().clamp(ts_lo, ts_hi - 1)
 
-    # Default: "flow_shift" — shift parsed from dist_params
-    shift = max(0.0, params.get("shift", 3.0))
+    # Default: flow_shift with the supplied shift value.
+    shift = max(0.0, float(shift))
     if shift <= 1.0:
         return torch.randint(ts_lo, ts_hi, (n,), device=device)
     u = torch.rand(n, device=device)

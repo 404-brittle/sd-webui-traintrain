@@ -74,12 +74,19 @@ image_buckets_step  = ["image_buckets_step", "DD", IMAGESTEPS, "256", int,  LORA
 image_mirroring     = ["image_mirroring",    "CH", None, False, bool, LORA_MDIFF]
 image_use_filename_as_tag = ["image_use_filename_as_tag","CH", None, False, bool, LORA_MDIFF]
 image_disable_upscale = ["image_disable_upscale","CH", None, False, bool, LORA_MDIFF]
-texture_mode        = ["texture_mode",        "CH", None, False, bool, LORA_MDIFF]
+texture_mode        = ["texture_mode",        "CH", None, True, bool, LORA_MDIFF]
+texture_min_tile   = ["texture_min_tile(px)", "TX", None, 256, int, LORA_MDIFF]
+texture_max_tile   = ["texture_max_tile(px)", "TX", None, 1024, int, LORA_MDIFF]
+texture_tile_snap  = ["texture_tile_snap(px)", "TX", None, 128, int, LORA_MDIFF]
+texture_min_shift  = ["texture_min_shift",    "TX", None, 0.5, float, LORA_MDIFF]
+texture_max_shift  = ["texture_max_shift",    "TX", None, 3.0, float, LORA_MDIFF]
+texture_tile_step_epochs  = ["texture_tile_step_epochs",  "TX", None, 5, int, LORA_MDIFF]
+texture_shift_step_epochs = ["texture_shift_step_epochs", "TX", None, 5, int, LORA_MDIFF]
 texture_feather_latent_px = ["texture_feather_latent_px", "TX", None, 2, int, LORA_MDIFF]
 texture_mask_directory = ["texture_mask_directory", "TX", None, "", str, LORA_MDIFF]
-texture_tile_scale  = ["texture_tile_scale",  "TX", None, 1.0, float, LORA_MDIFF]
-texture_tile_resolution = ["texture_tile_resolution", "TX", None, 0, int, LORA_MDIFF]
 texture_energy_threshold = ["texture_energy_threshold", "TX", None, 0, float, LORA_MDIFF]
+texture_avoid_masked = ["texture_avoid_masked", "CH", None, True, bool, LORA_MDIFF]
+texture_crop_aspect = ["texture_crop_aspect(e.g. 2:1,3:1)", "TX", None, "", str, LORA_MDIFF]
 save_per_steps      = ["save_per_steps",     "TX", None, 0,    int,   ALL]
 save_precision      = ["save_precision",     "DD", PRECISION_TYPES[:3], "fp16", str, ALL]
 diff_revert_original_target = ["diff_revert_original_target","CH", None, False, bool, DIFF]
@@ -93,7 +100,7 @@ TIMESTEP_DISTRIBUTIONS = ["uniform", "flow_shift", "logit_normal", "cosmap", "be
 train_timestep_distribution = ["train_timestep_distribution", "DD", TIMESTEP_DISTRIBUTIONS, "flow_shift", str, ALL]
 train_ts_dist_params = ["train_ts_dist_params(e.g. mean=0.0 std=1.0)", "TX", None, "", str, ALL]
 train_ts_schedule   = ["train_ts_schedule",   "ML", None, "",   str,   ALL]
-train_hybrid_mode   = ["train_hybrid_mode",   "CH", None, False, bool, ALL]
+train_hybrid_mode   = ["train_hybrid_mode(legacy, unused)",   "CH", None, False, bool, ALLN]
 network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", None, "", str, ALL]
 
 # Column groupings
@@ -103,8 +110,10 @@ r_column3 = [train_optimizer, train_optimizer_settings, train_lr_scheduler, trai
 
 # Bucket / Texture parameters
 b_column = [image_buckets_step, image_mirroring, image_use_filename_as_tag, image_disable_upscale,
-            train_fixed_timsteps_in_batch, texture_mode, texture_feather_latent_px, texture_mask_directory,
-            texture_tile_scale, texture_tile_resolution, texture_energy_threshold]
+            train_fixed_timsteps_in_batch, texture_mode, texture_min_tile, texture_max_tile, texture_tile_snap,
+            texture_min_shift, texture_max_shift, texture_tile_step_epochs, texture_shift_step_epochs,
+            texture_feather_latent_px, texture_mask_directory, texture_energy_threshold,
+            texture_avoid_masked, texture_crop_aspect]
 
 # Other Options (everything else)
 o_column1 = [train_seed, train_loss_function, save_per_steps,

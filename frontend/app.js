@@ -93,6 +93,12 @@ const ALL_CONFIGS = [
   ["train_ts_schedule",   "ML", null, "",   "str",   ALL],
   ["train_hybrid_mode(legacy, unused)",   "CH", null, false, "bool", ALLN],
   ["network_module_filter(regex, !prefix=exclude)", "TX", null, "", "str", ALL],
+
+  // ── Score smoothing (Section 3.1: score smoothing via NN regularization) ──
+  ["score_smoothing_penalty",    "TX", null, 0.0,   "float", ALL],
+  ["score_smoothing_kappa",      "TX", null, 1.44,  "float", ALL],
+  ["score_smoothing_mc",         "CH", null, false, "bool",  ALL],
+  ["score_smoothing_mc_samples", "TX", null, 4,     "int",   ALL],
 ];
 
 // ── Column groupings ───────────────────────────────────────────
@@ -116,6 +122,14 @@ const O_COLUMN2 = ["train_model_precision", "train_lora_precision", "save_precis
 
 const O_TS_COLUMN = ["train_min_timesteps", "train_max_timesteps", "train_timestep_distribution", "train_ts_dist_params(e.g. mean=0.0 std=1.0)", "train_ts_schedule", "train_hybrid_mode"];
 const O_LAYER_COLUMN = ["network_module_filter(regex, !prefix=exclude)"];
+
+// Score Smoothing (paper-inspired regularization)
+const SS_COLUMN = [
+  "score_smoothing_penalty",
+  "score_smoothing_kappa",
+  "score_smoothing_mc",
+  "score_smoothing_mc_samples",
+];
 
 // ── Dist colors ────────────────────────────────────────────────
 
@@ -805,6 +819,7 @@ function init() {
   buildSection('option-params', O_COLUMN1.concat(O_COLUMN2), 3);
   buildSection('ts-controls', O_TS_COLUMN, 1);
   buildSection('layer-controls', O_LAYER_COLUMN, 1);
+  buildSection('score-smoothing-params', SS_COLUMN, 2);
 
   // Initial previews
   renderTsPreview();

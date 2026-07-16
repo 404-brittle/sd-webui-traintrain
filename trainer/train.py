@@ -24,6 +24,7 @@ from trainer.anima_support import (
 from pprint import pprint
 from typing import Optional
 from accelerate.utils import set_seed
+from math import sqrt as _sqrt
 
 try:
     from modules import shared
@@ -366,6 +367,17 @@ def train_lora(t):
 
                 # Flow matching loss target: velocity = noise - latents
                 velocity_target = (noise - latents).to(torch.float32)
+
+                # ── Monte-Carlo smoothed target (paper Section 3.1, Eq. 9) ──
+                mc_smoothing = getattr(t, 'score_smoothing_mc', False)
+                if mc_smoothing:
+                    mc_samples = max(1, int(getattr(t, 'score_smoothing_mc_samples', 4) or 4))
+                    mc_kappa = getattr(t, 'score_smoothing_kappa', 1.44) or 1.44
+                    velocity_target = _mc_smooth_target(
+                        latents, noise, timesteps,
+                        n_samples=mc_samples, kappa=mc_kappa,
+                    )
+
                 train_mask = batch.get("mask")
                 if train_mask is not None:
                     train_mask = train_mask.to(CUDA)
@@ -847,6 +859,97 @@ def makesavelist(t):
         t.save_list = []
 
 
+def _score_smoothing_penalty(model_pred: torch.Tensor, timesteps: torch.Tensor,
+                              kappa: float = 1.44) -> torch.Tensor:
+    """Score-smoothing penalty inspired by the non-smoothness measure R[f] = ∫|f''(x)|dx.
+
+    The paper proves that regularizing R[f] causes the NN to learn a smoothed
+    version of the empirical score/velocity function, which drives interpolation
+    rather than memorization. In the high-dimensional latent space of a DiT,
+    we approximate this via a spatial Laplacian penalty on the predicted velocity
+    field, weighted by a timestep-dependent factor δ(t) ∝ κ√t (Proposition 1).
+
+    Args:
+        model_pred: [B, C, H, W] predicted velocity.
+        timesteps: [B] integer timesteps in [0, 1000].
+        kappa: Smoothing strength parameter (δ = κ√(t/1000)).
+
+    Returns:
+        Scalar penalty value.
+    """
+    B, C, H, W = model_pred.shape
+    # Normalised timesteps in [0, 1]
+    t_norm = timesteps.float() / 1000.0  # [B]
+    # δ(t) = κ√t — the smoothing window width (paper Proposition 1, Lemma 2)
+    # The penalty is strongest at small t (where δ is small → less smoothing → more need to penalise)
+    # We weight: w_smooth = 1 / (δ(t) + ε)  so small t gets high weight
+    delta = kappa * torch.sqrt(t_norm.clamp(min=1e-6))  # [B]
+    w_smooth = 1.0 / (delta + 0.01)  # [B], stronger penalty at small t
+
+    # Spatial Laplacian penalty: ||Δ(velocity)||²  approximates ∫|f''(x)|dx
+    # in the spatial dimensions of the latent space.
+    # Finite-difference Laplacian: Δv ≈ v[i+1,j] + v[i-1,j] + v[i,j+1] + v[i,j-1] - 4*v[i,j]
+    laplacian = (
+        F.pad(model_pred[:, :, :-1, :], (0, 0, 1, 0)) +
+        F.pad(model_pred[:, :, 1:, :], (0, 0, 0, 1)) +
+        F.pad(model_pred[:, :, :, :-1], (1, 0, 0, 0)) +
+        F.pad(model_pred[:, :, :, 1:], (0, 1, 0, 0)) -
+        4.0 * model_pred
+    )
+    # Mean squared Laplacian per sample → [B]
+    penalty_per_sample = laplacian.pow(2).mean(dim=[1, 2, 3])
+
+    # Weight by timestep-dependent factor and average
+    weighted_penalty = (penalty_per_sample * w_smooth).mean()
+    return weighted_penalty
+
+
+def _mc_smooth_target(latents: torch.Tensor, noise: torch.Tensor,
+                       timesteps: torch.Tensor, n_samples: int = 4,
+                       kappa: float = 1.44) -> torch.Tensor:
+    """Monte-Carlo smoothed velocity target — mirrors esf_mc_smoothed() from the paper.
+
+    The paper (Section 3.1, Eq. 9) shows that averaging the ESF over a local
+    window of width δ = κ√t produces a smoothed score that drives interpolation.
+    Here we apply the same principle to the flow-matching velocity target by
+    jittering the latents within a δ-sized window and averaging the resulting
+    velocity targets.
+
+    Args:
+        latents: [B, C, H, W] clean latents.
+        noise: [B, C, H, W] noise tensor.
+        timesteps: [B] integer timesteps in [0, 1000].
+        n_samples: Number of MC samples.
+        kappa: Smoothing strength.
+
+    Returns:
+        [B, C, H, W] smoothed velocity target.
+    """
+    B, C, H, W = latents.shape
+    t_norm = timesteps.float() / 1000.0  # [B]
+    # δ(t) = κ√t — the smoothing window (paper Lemma 2: δ_t = κ√t)
+    delta = kappa * torch.sqrt(t_norm.clamp(min=1e-6))  # [B]
+    # Scale window to latent-space units (typical latent dim ~64-128, so
+    # a δ of 0.05–0.2 corresponds to 3–13 pixels of jitter at 64px latents)
+    delta = delta * (H / 64.0)  # scale by relative latent resolution
+
+    # Generate jittered copies: [n_samples, B, C, H, W]
+    jitter = torch.randn(n_samples, B, C, H, W, device=latents.device, dtype=latents.dtype)
+    # Scale jitter by δ per batch element
+    delta_4d = delta.view(B, 1, 1, 1)  # [B, 1, 1, 1]
+    jitter = jitter * delta_4d.unsqueeze(0)  # [n_samples, B, C, H, W]
+
+    # Compute velocity targets for each jittered copy
+    # velocity = noise - (latents + jitter)
+    velocities = []
+    for k in range(n_samples):
+        v = noise - (latents + jitter[k])
+        velocities.append(v)
+
+    smoothed = torch.stack(velocities, dim=0).mean(dim=0)
+    return smoothed
+
+
 def process_loss(t, original, target, timesteps, loss_ema, loss_velocity,
                  mask=None, copy=False, ts_weights=None):
     if t.train_loss_function == "MSE":
@@ -877,6 +980,13 @@ def process_loss(t, original, target, timesteps, loss_ema, loss_velocity,
         loss = (loss * w).sum() / w.sum().clamp(min=1e-8)
     else:
         loss = loss.mean()
+
+    # ── Score smoothing penalty (paper Section 3.1, Proposition 1) ──────────
+    smoothing_penalty_weight = getattr(t, 'score_smoothing_penalty', 0.0) or 0.0
+    if smoothing_penalty_weight > 0.0:
+        kappa = getattr(t, 'score_smoothing_kappa', 1.44) or 1.44
+        penalty = _score_smoothing_penalty(original, timesteps, kappa=kappa)
+        loss = loss + smoothing_penalty_weight * penalty
 
     if loss_ema is None:
         loss_ema = loss.item()

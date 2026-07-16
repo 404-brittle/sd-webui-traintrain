@@ -132,6 +132,21 @@
         </div>
       </details>
 
+      <!-- ===== Score Smoothing (paper: On the Interpolation Effect of Score Smoothing) ===== -->
+      <details class="section" open>
+        <summary class="section-title">Score Smoothing (Interpolation Regularization)</summary>
+        <div class="section-grid cols-2" id="score-smoothing-params"></div>
+        <div class="section-help" style="margin-top: 0.5rem; padding: 0.5rem; background: #1e293b; border-radius: 6px; font-size: 0.85rem; color: #94a3b8;">
+          <strong>Score Smoothing</strong> (Chen, ICLR 2026) penalizes non-smoothness in the learned velocity field, causing the model to <em>interpolate</em> between training concepts rather than <em>memorize</em> exact training pairs.
+          <ul style="margin: 0.25rem 0 0 1.25rem; padding: 0;">
+            <li><strong>Penalty weight</strong> — strength of the Laplacian smoothness regularizer (0 = disabled). Recommended: 0.001–0.01.</li>
+            <li><strong>Kappa (κ)</strong> — smoothing window δ = κ√t. Larger κ = more smoothing at small timesteps. Paper default: 1.44.</li>
+            <li><strong>MC smoothing</strong> — Monte-Carlo average velocity target over jittered latents (paper §3.1, Eq. 9).</li>
+            <li><strong>MC samples</strong> — number of jitter samples for MC averaging.</li>
+          </ul>
+        </div>
+      </details>
+
       <!-- ===== Layers ===== -->
       <details class="section" open>
         <summary class="section-title">Layers</summary>

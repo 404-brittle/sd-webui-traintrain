@@ -103,6 +103,12 @@ train_ts_schedule   = ["train_ts_schedule",   "ML", None, "",   str,   ALL]
 train_hybrid_mode   = ["train_hybrid_mode(legacy, unused)",   "CH", None, False, bool, ALLN]
 network_module_filter = ["network_module_filter(regex, !prefix=exclude)", "TX", None, "", str, ALL]
 
+# ── Score smoothing (Section 3.1: score smoothing via NN regularization) ──
+score_smoothing_penalty      = ["score_smoothing_penalty",      "TX", None, 0.0,    float, ALL]
+score_smoothing_kappa        = ["score_smoothing_kappa",        "TX", None, 1.44,   float, ALL]
+score_smoothing_mc           = ["score_smoothing_mc",           "CH", None, False,  bool,  ALL]
+score_smoothing_mc_samples   = ["score_smoothing_mc_samples",   "TX", None, 4,      int,   ALL]
+
 # Column groupings
 r_column1 = [network_rank, network_alpha, lora_data_directory, diff_target_name, lora_trigger_word]
 r_column2 = [image_size, train_iterations, train_batch_size, train_learning_rate]
@@ -126,4 +132,7 @@ o_layer_column = [network_module_filter]
 
 model_column = [qwen3_path, t5_tokenizer_path]
 
-trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + b_column + o_column1 + o_column2 + o_ts_column + o_layer_column
+# Score smoothing column (paper-inspired regularization)
+ss_column = [score_smoothing_penalty, score_smoothing_kappa, score_smoothing_mc, score_smoothing_mc_samples]
+
+trainer.all_configs = model_column + r_column1 + r_column2 + r_column3 + b_column + o_column1 + o_column2 + o_ts_column + o_layer_column + ss_column
